@@ -59,6 +59,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from slide_solver import (  # noqa: E402
     ENDPOINTS,
     ENDPOINTS_QQ,
+    TDC_SERVER,
     SlideSolver,
     SlideSolverConfig,
     SlideSolverError,
@@ -117,9 +118,13 @@ def _solver_key_for(endpoints, aid_int: int | None) -> tuple:
 
 def _make_solver(endpoints, aid_int: int | None) -> SlideSolver:
     """建一个 solver。调用方须持有 _solver_lock。"""
+    # Node 可执行文件：插件侧会把探测到的路径通过环境变量传进来
+    # （nvm / 非默认 PATH 的环境里裸 `node` 可能找不到）。
+    node_command = (os.environ.get("QQ_SLIDER_NODE") or "").strip() or "node"
     config = SlideSolverConfig(
         heat_control=False,      # 绝不故意失败
         reuse_tdc_worker=True,   # 复用 Node 进程，热态关键
+        node_command=node_command,
     )
     return SlideSolver(config=config, endpoints=endpoints, aid=aid_int)
 
@@ -163,6 +168,30 @@ def _bump(ok: bool, seconds: float, rounds: int) -> None:
         _stats["ok" if ok else "fail"] += 1
         _stats["rounds"] += rounds
         _stats["total_s"] = round(_stats["total_s"] + seconds, 3)
+
+
+def _env_probe() -> dict:
+    """报一下运行环境，供插件侧 #滑块过码状态 显示。
+
+    只做**廉价**的检查（不联网、不起进程），所以可以每次 /health 都算。
+    """
+    import shutil as _shutil
+
+    node_cmd = (os.environ.get("QQ_SLIDER_NODE") or "").strip() or "node"
+    deps = {}
+    for name in ("cv2", "numpy", "curl_cffi", "requests"):
+        try:
+            __import__(name)
+            deps[name] = True
+        except Exception:
+            deps[name] = False
+    return {
+        "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "node": _shutil.which(node_cmd) or None,
+        "nodeCommand": node_cmd,
+        "deps": deps,
+        "tdcServer": TDC_SERVER.name,
+    }
 
 
 def parse_slider_url(url: str) -> dict:
@@ -342,6 +371,7 @@ class Handler(BaseHTTPRequestHandler):
             snap["successRate"] = f"{snap['ok'] / total * 100:.0f}%" if total else "-"
             snap["avgSeconds"] = round(snap["total_s"] / total, 2) if total else 0
             snap["avgRounds"] = round(snap["rounds"] / total, 2) if total else 0
+            snap["env"] = _env_probe()
             self._json(200, {"status": "ok", **snap})
             return
         self._json(404, {"error": "not found"})

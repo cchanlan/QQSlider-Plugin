@@ -45,7 +45,7 @@ export async function solveSlider({
       signal: controller.signal,
     })
   } catch (err) {
-    if (err?.name === "AbortError") throw new Error(`过码超时（${timeout}ms）`)
+    if (err?.name === "AbortError") throw new Error(`过码超时（${Math.round((Number(timeout) || 120000) / 1000)}秒）`)
     throw new Error(`过码服务不可用：${err?.message || err}`)
   } finally {
     clearTimeout(timer)

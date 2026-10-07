@@ -11,9 +11,13 @@
  * 为什么 `verify.<QQ>` 是稳的：它是云崽核心
  * （`plugins/system/botOperate.js` 的 `#Bot验证` 指令）与适配器之间的既有约定，
  * 不是某个插件私有的钩子 —— ICQQ-Plugin 的 `get()` 等的就是它。
+ *
+ * ⚠️ TRSS-Yunzai / Miao-Yunzai / JiuLi 三家的 `Bot` 都是 EventEmitter，
+ * 但挂在上面的方法名不完全一样（JiuLi 的 Bot 是 Proxy，属性会回落到 util）。
+ * 所以这里**一律能力探测 + 多级兜底**，不假设某个方法一定存在。
  */
 
-import { health, depsReady, findPython } from "./service.js"
+import { health, depsReady, envReport } from "./service.js"
 import { solveSlider } from "./solver.js"
 
 let installed = false
@@ -23,25 +27,85 @@ const inFlight = new Set()
 function logMsg(level, msg) {
   try {
     Bot.makeLog(level, msg, "QQSlider")
+    return
   } catch {
+    /* 落到下面的兜底 */
+  }
+  try {
+    logger[level]?.(msg)
+  } catch {
+    /* 兜底：连 logger 都没有就算了 */
+  }
+}
+
+/** 取 bots 里的账号 id 列表（三家框架的 `Bot.bots` 都是 { [id]: bot }） */
+function botIds() {
+  try {
+    return Object.keys(Bot?.bots || {}).filter(Boolean)
+  } catch {
+    return []
+  }
+}
+
+/** 取 uin 列表。`Bot.uin` 各家都是特化数组，展开成普通数组 */
+function uinList() {
+  try {
+    return [...(Bot?.uin || [])].map(String).filter(Boolean)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 给主人发消息。按可用性依次尝试：
+ *   1. `Bot.sendMasterMsg`  —— TRSS / JiuLi 都有，最省事
+ *   2. 直接给 cfg.master 里的号发好友消息
+ *   3. 都不可用就只写日志，绝不因为「通知发不出去」把过码流程带崩
+ */
+async function notify(msg) {
+  if (typeof Bot?.sendMasterMsg === "function") {
     try {
-      logger[level]?.(msg)
-    } catch {
-      /* 兜底：连 logger 都没有就算了 */
+      await Bot.sendMasterMsg(msg)
+      return
+    } catch (err) {
+      logMsg("debug", `sendMasterMsg 失败，改用备用通道：${err?.message || err}`)
     }
   }
-}
 
-async function notify(msg) {
+  let masters = []
   try {
-    if (typeof Bot.sendMasterMsg === "function") await Bot.sendMasterMsg(msg)
-  } catch (err) {
-    logMsg("error", `发送消息失败 ${err}`)
+    const cfg = (await import("../../lib/config/config.js")).default
+    masters = Object.keys(cfg?.master || {})
+  } catch {
+    /* 取不到配置就算了，下面的通道还能用 */
   }
+
+  const targets = masters.length ? masters : uinList().slice(0, 1)
+  for (const id of targets) {
+    try {
+      if (typeof Bot?.pickFriend === "function") {
+        const friend = Bot.pickFriend(Number(id))
+        if (typeof friend?.sendMsg === "function") {
+          await friend.sendMsg(msg)
+          return
+        }
+      }
+      if (typeof Bot?.sendFriendMsg === "function") {
+        await Bot.sendFriendMsg(Bot.uin, Number(id), msg)
+        return
+      }
+    } catch (err) {
+      logMsg("debug", `给 ${id} 发消息失败：${err?.message || err}`)
+    }
+  }
+  logMsg("info", `（通知未送达，仅记录）${msg}`)
 }
 
+/** 服务地址：配置里的 host/port */
 export function baseUrlOf(cfg) {
-  return `http://${cfg?.host || "127.0.0.1"}:${cfg?.port || 8767}`
+  const host = cfg?.host || "127.0.0.1"
+  const port = cfg?.port || 8767
+  return `http://${host}:${port}`
 }
 
 /**
@@ -57,11 +121,15 @@ export function detectUin(url) {
   } catch {
     /* URL 畸形就往下退 */
   }
-  const uins = [...(Bot.uin || [])].filter(Boolean)
-  if (uins.length === 1) return String(uins[0])
-  const ids = Object.keys(Bot.bots || {})
+
+  const uins = uinList()
+  if (uins.length === 1) return uins[0]
+
+  const ids = botIds()
   if (ids.length === 1) return ids[0]
-  return ""
+  // 多个账号时退而求其次：优先挑 URL 里出现过的那一个
+  const hit = uins.find(id => url.includes(id)) || ids.find(id => url.includes(id))
+  return hit ? String(hit) : ""
 }
 
 /**
@@ -71,14 +139,23 @@ export function detectUin(url) {
  * `bot.submitSlider(msg)`，这样它的等待循环会正常结束、不会 3 分钟后
  * 再报一句「滑动验证超时」。
  * 没有监听者时直接调 `submitSlider`（JiuLi / 其它框架上更保险）。
+ *
+ * @returns {Promise<"verify"|"direct">} 实际走的通道
  */
 async function submitTicket(id, ticket) {
   const event = `verify.${id}`
-  if (typeof Bot.listenerCount === "function" && Bot.listenerCount(event) > 0) {
-    Bot.em(event, { msg: ticket, reply: m => notify(m) })
+  const hasListener = typeof Bot?.listenerCount === "function" && Bot.listenerCount(event) > 0
+  if (hasListener) {
+    // `em` 是云崽给 verify 通道的特化方法（TRSS `lib/bot.js:426`、JiuLi `lib/core/bot.js:581`），
+    // 行为等价于 `emit` 但会走框架自己的日志；fork 上万一没有就退回原生 emit。
+    const payload = { msg: ticket, reply: m => notify(m) }
+    if (typeof Bot.em === "function") Bot.em(event, payload)
+    else if (typeof Bot.emit === "function") Bot.emit(event, payload)
+    else throw new Error("Bot 既没有 em() 也没有 emit()，无法提交 ticket")
     return "verify"
   }
-  const bot = Bot[id]
+
+  const bot = Bot?.[id]
   if (bot && typeof bot.submitSlider === "function") {
     await bot.submitSlider(ticket)
     return "direct"
@@ -97,7 +174,7 @@ export function installSliderHook({ getConfig }) {
   if (installed) return false
   installed = true
 
-  Bot.on("system.login.slider", async data => {
+  const handler = async data => {
     const cfg = getConfig() || {}
     if (!cfg.enable) return
 
@@ -112,6 +189,7 @@ export function installSliderHook({ getConfig }) {
       // 手动模式：只把 URL 发出来，不接管（交给 ICQQ-Plugin 原来的选单）
       if (cfg.mode !== "auto") {
         logMsg("info", `手动模式，滑块 URL：${url}`)
+        await notify(`收到滑块验证，请手动完成：\n${url}`)
         return
       }
 
@@ -140,7 +218,13 @@ export function installSliderHook({ getConfig }) {
     } finally {
       inFlight.delete(url)
     }
-  })
+  }
+
+  if (typeof Bot?.on !== "function") {
+    logMsg("error", "Bot 上找不到 on()，无法接管滑块验证")
+    return false
+  }
+  Bot.on("system.login.slider", handler)
 
   logMsg("info", "已接管滑块验证（system.login.slider）")
   return true
@@ -161,8 +245,8 @@ export async function getStatus(cfg) {
     mode: cfg?.mode || "auto",
     baseUrl,
     depsReady: depsReady(),
-    python: findPython(),
     running: !!running,
     health: running,
+    env: envReport(),
   }
 }
