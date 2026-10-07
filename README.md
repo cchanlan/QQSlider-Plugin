@@ -32,11 +32,14 @@ git clone <本仓库地址> QQSlider-Plugin
 > 需要机器上有 **Python 3.9+** 和 **Node.js**（云崽本来就要 Node）。
 > 没装 Python 的话，发 `#滑块过码安装` 会提示你。
 
+**支持云崽全生态**：TRSS-Yunzai、Miao-Yunzai、JiuLi 都能直接跑，
+Windows 和 Linux 都能跑。缺什么依赖插件会自己探测、自己装。
+
 ## 指令
 
 | 指令 | 作用 |
 |---|---|
-| `#滑块过码状态` | 看接管状态、服务是否在跑、成功率统计 |
+| `#滑块过码状态` | 看接管状态、服务是否在跑、Python/Node 有没有找到、成功率统计 |
 | `#滑块过码安装` | 手动装依赖并启动服务 |
 | `#滑块过码测试` | 真解一次验证码，确认环境可用 |
 | `#滑块过码开启` / `#滑块过码关闭` | 开关自动过码 |
@@ -53,6 +56,7 @@ port: 8767            # 过码服务端口
 rounds: 3             # 每次最多试几轮
 timeout: 180000       # 单次超时（毫秒）
 autoInstall: true     # 首次加载自动装 Python 依赖
+permission: master    # 指令权限：master / admin / all
 ```
 
 `mode: manual` 适合你想自己过码、只是想省掉「选验证方式」那一步的场景。
@@ -67,6 +71,18 @@ autoInstall: true     # 首次加载自动装 Python 依赖
 
 `verify.<QQ>` 是云崽核心（`plugins/system/botOperate.js` 的 `#Bot验证` 指令）
 与适配器之间的既有约定，不是某个插件私有的钩子 —— 所以 ICQQ-Plugin 更新也不会失效。
+
+### 多框架适配
+
+三家的 `Bot` 都从 `EventEmitter` 来，但挂在上面的方法名不完全一样，
+所以插件一律**能力探测 + 多级兜底**，不写死任何一家的特性：
+
+| 要做的事 | 优先级 |
+|---|---|
+| 取配置 | 框架的 `lib/plugins/config.js` → 自己读写 YAML → JSON |
+| 发通知 | `Bot.sendMasterMsg` → `Bot.pickFriend` → `Bot.sendFriendMsg` → 只写日志 |
+| 提交 ticket | `verify.<QQ>` 事件（`Bot.em` → `Bot.emit`）→ 直接 `submitSlider` |
+| 认 QQ 号 | URL 的 `uin` → 唯一在线账号 → URL 里出现过的账号 |
 
 ## 它是怎么过码的
 
@@ -89,6 +105,7 @@ autoInstall: true     # 首次加载自动装 Python 依赖
 QQSlider-Plugin/
 ├── index.js              # 插件入口、指令
 ├── utils/
+│   ├── config.js         # 配置加载（三框架自适应 + 兜底）
 │   ├── hook.js           # 滑块事件接管（与 ICQQ-Plugin 的唯一接缝）
 │   ├── service.js        # 服务生命周期（找 Python/建 venv/装依赖/起停）
 │   └── solver.js         # 过码服务客户端
@@ -105,7 +122,22 @@ QQSlider-Plugin/
 - **Node.js**（云崽本来就要）
 - Python 依赖：`curl-cffi`、`requests`、`numpy`、`opencv-python`、`Pillow`（插件自动装）
 
-依赖默认走清华源（国内直连 PyPI 经常超时）。要换源：
+### 依赖会自动装
+
+你不需要手动 `pip install`。插件按「缺什么装什么」来：
+
+1. 找 Python（Windows 先试 `python`/`py`，Linux 先试 `python3`，都用 `--version` 验真）
+2. 没有虚拟环境就建一个，装在插件自己的 `service/.venv/`，不动系统环境
+3. 装依赖时先用这个虚拟环境探一次 pip 缓存目录能不能写 —— **写不了就自动跳过缓存**，
+   免得卡住
+4. 镜像源按 清华 → 阿里 → 官方 依次重试；某个源 90 秒没响应就换下一个
+5. 装完真 `import` 一遍 `cv2`/`numpy` 等，确认能用才算成功
+
+装好后发 `#滑块过码状态` 能直接看到 Python/Node 版本和依赖就绪情况。
+
+### 换镜像源
+
+默认走清华源（国内直连 PyPI 经常超时）。要换源：
 
 ```bash
 # Linux / macOS
@@ -121,8 +153,11 @@ QQ 登录的题型由服务端按 `uin` + `cap_cd` 决定。这个提示说明�
 （可能是点选）。本插件只解滑块 —— QQ 登录验证正常就是滑块，遇到点选请手动过一次。
 
 **Q：服务起不来？**
-发 `#滑块过码状态` 看 Python 有没有找到、依赖装没装上。
+发 `#滑块过码状态` 看 Python / Node 有没有找到、依赖装没装上，缺什么会直接列出来。
 手动装：`#滑块过码安装`。
+
+**Q：在 Linux 上提示缺少 venv 组件？**
+Debian / Ubuntu 上执行 `apt install python3-venv`，然后发 `#滑块过码安装`。
 
 **Q：会不会拖慢云崽启动？**
 不会。装依赖和服务启动都在后台进行，不阻塞启动。过码只在登录遇到滑块时才用到。
