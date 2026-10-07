@@ -11,21 +11,30 @@
 
 装上本插件后：**遇到滑块自动过，你什么都不用做。**
 
-## 一键部署
+## 安装
 
+**在云崽根目录执行**，三个源任选一个（内容完全一样，推荐国内的 gitcode 或 gitee）：
+
+**gitcode（国内直连最快）**
 ```bash
-# 1. 进云崽的插件目录
-cd Yunzai/plugins
-
-# 2. 拉插件
-git clone <本仓库地址> QQSlider-Plugin
-
-# 3. 重启云崽（或发 #重启）
+git clone --depth=1 https://gitcode.com/ccxhan/QQSlider-Plugin.git ./plugins/QQSlider-Plugin
 ```
 
-**完事。** 剩下的插件自己会做：
+**gitee（国内）**
+```bash
+git clone --depth=1 https://gitee.com/longhengmu/QQSlider-Plugin.git ./plugins/QQSlider-Plugin
+```
 
-- 首次加载自动创建 Python 虚拟环境、装依赖（后台进行，约 1~3 分钟，**不阻塞云崽启动**）
+**GitHub**
+```bash
+git clone --depth=1 https://github.com/cchanlan/QQSlider-Plugin.git ./plugins/QQSlider-Plugin
+```
+
+重启云崽（或发 `#重启`）即可，**不用装依赖**。
+
+首次加载插件自己会做：
+
+- 创建 Python 虚拟环境、装依赖（后台进行，约 1~3 分钟，**不阻塞云崽启动**）
 - 依赖装好后自动拉起过码服务
 - 之后登录遇到滑块自动过码
 
