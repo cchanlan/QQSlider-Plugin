@@ -511,7 +511,10 @@ export async function stopService({ timeout = 5000 } = {}) {
       return
     }
     const timer = setTimeout(() => resolve(false), timeout)
-    proc.once("exit", () => {
+    // 等 `close` 而不是 `exit`：`exit` 只代表进程没了，stdio 管道可能还在关；
+    // 紧接着 process.exit() 会让 libuv 在句柄关闭途中退出并断言崩溃。
+    // `close` 的语义就是「进程已退出且所有 stdio 流已关闭」，正好是我们要的边界。
+    proc.once("close", () => {
       clearTimeout(timer)
       resolve(true)
     })
@@ -522,6 +525,18 @@ export async function stopService({ timeout = 5000 } = {}) {
       resolve(true)
     }
   })
+
+  // 手动把管道收干净再返回。
+  // 即使 `close` 因为 unref 过而没等到，这一步也能把句柄销毁掉，
+  // 避免调用方紧接着 process.exit() 时撞上
+  // `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)`。
+  for (const s of [proc.stdout, proc.stderr]) {
+    try {
+      s?.destroy?.()
+    } catch {
+      /* 已经关了 */
+    }
+  }
 
   // 没死透就把句柄还回 unref，免得反而把云崽吊住
   if (!exited) {
