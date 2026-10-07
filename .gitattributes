@@ -1,0 +1,13 @@
+# 统一用 LF：这个仓库要跨 Windows / Linux 部署，
+# CRLF 会让 Linux 上的 Python / shell 出问题。
+* text=auto eol=lf
+
+# 明确二进制，别被行尾转换弄坏
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff2 binary
+
+# Windows 批处理必须留 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf

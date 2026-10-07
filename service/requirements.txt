@@ -1,0 +1,5 @@
+curl-cffi>=0.15,<1
+requests>=2.31,<3
+numpy>=1.26,<3
+opencv-python>=4.8,<5
+Pillow>=10,<13

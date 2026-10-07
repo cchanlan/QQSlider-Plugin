@@ -1,0 +1,20 @@
+{
+  "name": "qq-slider-plugin",
+  "version": "1.0.0",
+  "description": "QQ 滑块自动过码 —— 纯协议、零浏览器，登录遇到滑块自动通过",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "yunzai",
+    "icqq",
+    "captcha",
+    "slider",
+    "tcaptcha"
+  ],
+  "author": "cchanlan",
+  "license": "MIT",
+  "dependencies": {}
+}

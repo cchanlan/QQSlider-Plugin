@@ -1,0 +1,19 @@
+# Python 虚拟环境（每台机器自己建，不进版本控制）
+service/.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 依赖校验标记
+service/.venv/.deps-ok
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 日志与临时文件
+*.log
+_s*.out
+_s*.err
