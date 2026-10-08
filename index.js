@@ -1,6 +1,6 @@
 import { makePluginConfig } from "./utils/config.js"
 import { installSliderHook, getStatus, baseUrlOf } from "./utils/hook.js"
-import { installDeps, depsReady, health, ensureRunning } from "./utils/service.js"
+import { installDeps, depsReady, health, ensureRunning, restartService, codeHashInfo } from "./utils/service.js"
 
 logger.info(logger.yellow("- 正在加载 QQ 滑块过码插件"))
 
@@ -57,6 +57,13 @@ export class QQSlider extends plugin {
           permission: config.permission,
         },
         {
+          // 别名写成两组，让「重启服务」这件事好记：
+          // 更新完插件后过码行为还是老的，就发这条
+          reg: "^#滑块过码(重启|重载|更新服务)$",
+          fnc: "Restart",
+          permission: config.permission,
+        },
+        {
           reg: "^#滑块过码测试$",
           fnc: "Test",
           permission: config.permission,
@@ -92,7 +99,12 @@ export class QQSlider extends plugin {
         })
       }, 3000)
     } else if (depsReady()) {
-      // 依赖已就绪，直接把服务拉起来（后台）
+      // 依赖已就绪，直接把服务拉起来（后台）。
+      //
+      // ⚠️ 这里同时承担**更新后换掉旧服务**的职责：`ensureRunning` 会比对
+      // 磁盘代码指纹和正在跑的服务的指纹，不一致就重启服务。
+      // 所以用户「更新插件 → 重启云崽」之后，**不用再做任何事**，
+      // Python 侧的新代码会在这一步自动生效（见 utils/service.js 的 ensureRunning）。
       setTimeout(() => {
         ensureRunning({
           baseUrl: baseUrlOf(config),
@@ -114,6 +126,18 @@ export class QQSlider extends plugin {
       `Python：${s.env?.python || "未找到"}`,
       `Node：${s.env?.node || "未找到"}`,
     ]
+    // 版本比对：跑的是不是磁盘上这份代码
+    if (s.running) {
+      const v = await codeHashInfo(s.baseUrl)
+      if (!v.ours) {
+        // 端口上有东西在响应，但不是本插件 —— 多半是端口被别的程序占了
+        lines.push(`版本：${s.baseUrl} 被别的程序占用（改 config 里的 port 或换一个）`)
+      } else if (v.stale) {
+        lines.push(`版本：服务跑的是旧代码（发 #滑块过码重启 更新）`)
+      } else if (v.known) {
+        lines.push(`版本：已是最新`)
+      }
+    }
     // 点选识别能力：查服务报回来的模型状态
     const click = s.health?.env?.click
     if (click) {
@@ -145,6 +169,26 @@ export class QQSlider extends plugin {
       logger: svcLogger,
     })
     await this.reply(started.ok ? "过码环境已就绪，登录遇到滑块会自动过码" : `服务启动失败：${started.error}`, true)
+  }
+
+  async Restart() {
+    await this.reply("正在重启过码服务…", true)
+    const stopped = await restartService({
+      baseUrl: baseUrlOf(config),
+      port: config.port,
+      logger: svcLogger,
+    })
+    if (!stopped) {
+      await this.reply("旧服务停不掉（端口可能被别的进程占着），重启云崽后再试", true)
+      return
+    }
+    const started = await ensureRunning({
+      baseUrl: baseUrlOf(config),
+      port: config.port,
+      rounds: config.rounds,
+      logger: svcLogger,
+    })
+    await this.reply(started.ok ? "过码服务已重启，跑的是最新代码" : `重启失败：${started.error}`, true)
   }
 
   async Test() {

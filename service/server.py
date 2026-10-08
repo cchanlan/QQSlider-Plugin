@@ -170,6 +170,82 @@ def _bump(ok: bool, seconds: float, rounds: int) -> None:
         _stats["total_s"] = round(_stats["total_s"] + seconds, 3)
 
 
+def _delayed_exit(delay: float = 0.3) -> None:
+    """稍等片刻再退出 —— 让 /shutdown 的 HTTP 响应先发完。
+
+    用 `os._exit` 而不是 `sys.exit`：这是在**后台线程**里跑的，
+    `sys.exit` 只结束该线程，主线程的 `serve_forever()` 还活着。
+    这里就是要整个进程立刻走，所以直接用 `os._exit`。
+
+    退出前顺手把常驻 solver 关掉，免得留下 Node worker 孤儿进程。
+    """
+    import time as _time
+
+    _time.sleep(delay)
+    try:
+        with _solver_lock:
+            _reset_solver()
+    except Exception:  # noqa: BLE001
+        pass
+    os._exit(0)
+
+
+# 源码指纹缓存（见 _code_hash）。进程存活期间代码不会变，算一次即可。
+_CODE_HASH_CACHE: str | None = None
+
+
+def _code_hash() -> str:
+    """service 目录下源码文件的**内容指纹**（16 位十六进制）。
+
+    ## 为什么需要它
+
+    `git pull` 只更新磁盘上的 `.py`，而**已经在跑的 Python 进程还在内存里
+    执行旧代码** —— 插件侧原来只做「服务活着吗」的健康检查，
+    于是会一直复用那个旧进程，表现为「明明更新了插件，行为还是老的」。
+
+    这个指纹就是给插件侧做**版本比对**用的：算一遍磁盘上的指纹，
+    跟 `/health` 报上来的（= 正在跑的那份代码的指纹）一比，
+    不一致就说明该重启服务了。
+
+    ## 细节
+
+    - 只算源码（`.py` / `.cjs`），**不算** `.venv` / `.models` / `__pycache__`
+      —— 那些不是代码，变了也不代表要重启。
+    - 文件名一起进哈希，避免「改了文件名但内容没变」时指纹不变。
+    - 结果缓存：进程活着期间这些文件不会变（真变了就该重启，不是热加载），
+      所以算一次就够，`/health` 每次都能秒回。
+    """
+    global _CODE_HASH_CACHE
+    if _CODE_HASH_CACHE is not None:
+        return _CODE_HASH_CACHE
+
+    import hashlib as _hashlib
+
+    digest = _hashlib.sha256()
+    here = Path(__file__).resolve().parent
+    try:
+        files = sorted(
+            (p for p in here.iterdir()
+             if p.is_file() and p.suffix in (".py", ".cjs") and not p.name.startswith(".")),
+            key=lambda p: p.name,
+        )
+    except OSError:
+        files = []
+
+    for path in files:
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            # 读不到也要参与哈希，否则「文件消失」会被算成「没变化」
+            digest.update(b"<unreadable>")
+        digest.update(b"\0")
+
+    _CODE_HASH_CACHE = digest.hexdigest()[:16]
+    return _CODE_HASH_CACHE
+
+
 def _env_probe() -> dict:
     """报一下运行环境，供插件侧 #滑块过码状态 显示。
 
@@ -191,6 +267,10 @@ def _env_probe() -> dict:
         "nodeCommand": node_cmd,
         "deps": deps,
         "tdcServer": TDC_SERVER.name,
+        # 正在运行的这份代码的指纹 —— 插件侧拿它跟磁盘上的比对，
+        # 不一致就说明「更新了但没重启」，见 _code_hash 的说明。
+        "codeHash": _code_hash(),
+        "pid": os.getpid(),
     }
     # 点选识别能力（只看模型文件在不在，不载模型 —— 载入要 0.9s，太重）
     try:
@@ -497,6 +577,22 @@ class Handler(BaseHTTPRequestHandler):
             snap["avgRounds"] = round(snap["rounds"] / total, 2) if total else 0
             snap["env"] = _env_probe()
             self._json(200, {"status": "ok", **snap})
+            return
+        if self.path.startswith("/shutdown"):
+            # 供插件侧「代码更新了，把旧进程换掉」用。
+            #
+            # 只允许本机调用：服务默认监听 127.0.0.1，但如果用户把 host 改成
+            # 0.0.0.0 暴露出去，这个端点就成了「谁能访问谁就能关服务」。
+            # 所以额外校验来源地址必须是回环。
+            client = self.client_address[0] if self.client_address else ""
+            if client not in ("127.0.0.1", "::1", "localhost"):
+                self._json(403, {"error": "shutdown 只允许本机调用"})
+                return
+            self._json(200, {"status": "shutting-down", "pid": os.getpid()})
+            LOG.info("收到 /shutdown（来自 %s），退出以便加载新代码", client)
+            # 放到后台线程里退：直接在请求处理线程里 os._exit 会让
+            # 上面那个响应还没发完就断连，插件侧会当成「调用失败」。
+            threading.Thread(target=_delayed_exit, name="shutdown", daemon=True).start()
             return
         self._json(404, {"error": "not found"})
 

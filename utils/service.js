@@ -16,6 +16,7 @@
  */
 
 import { spawn, spawnSync } from "node:child_process"
+import crypto from "node:crypto"
 import fs from "node:fs"
 import os from "node:os"
 import fsp from "node:fs/promises"
@@ -715,6 +716,37 @@ export async function ensureClickModel({ logger, force = false } = {}) {
   return ok
 }
 
+/**
+ * 给 `#滑块过码状态` 用的版本比对结果。
+ *
+ * ⚠️ 判据必须跟 `ensureRunning()` **完全一致**，否则会出现
+ * 「状态说已是最新、实际却在跑旧代码」这种最坑人的不一致。
+ * 所以这里不自己判断，直接复用同一套逻辑（见 `isOurService` / `diskSupportsCodeHash`）。
+ *
+ * @returns {Promise<{disk:string, running:string, stale:boolean, known:boolean, ours:boolean}>}
+ *   · disk    磁盘上这份代码的指纹
+ *   · running 正在跑的服务报的指纹（旧版服务为空串）
+ *   · stale   **跑的是旧代码**（该重启了）
+ *   · known   服务有没有报指纹（旧版服务报不了）
+ *   · ours    端口上的是不是过码服务
+ */
+export async function codeHashInfo(baseUrl) {
+  const disk = diskCodeHash()
+  const info = await health(baseUrl)
+  const ours = isOurService(info)
+  const running = String(info?.env?.codeHash || "")
+  return {
+    disk,
+    running,
+    ours,
+    known: !!running,
+    // 跟 ensureRunning 同一套判据：
+    //   磁盘代码有指纹能力 + 服务报不出或不一致 = 旧代码
+    // （旧版服务的 /health 连 env 都没有，running 自然是空串，同样命中）
+    stale: ours && diskSupportsCodeHash() && !!disk && (!running || running !== disk),
+  }
+}
+
 /** 健康检查 */
 export async function health(baseUrl, timeout = 3000) {
   const base = String(baseUrl || "").replace(/\/+$/, "")
@@ -729,6 +761,233 @@ export async function health(baseUrl, timeout = 3000) {
   } finally {
     clearTimeout(timer)
   }
+}
+
+/**
+ * 算「磁盘上这份代码」的指纹，跟服务端 `/health` 报的 `codeHash` 比对。
+ *
+ * ## 要解决的问题
+ *
+ * `git pull` / `#更新` 只把新文件写到磁盘上，**已经在跑的 Python 进程
+ * 还在内存里执行旧代码**。而 `ensureRunning()` 原来第一句就是
+ * 「服务活着就复用」，于是会一直用那个旧进程 ——
+ * 表现是「插件明明更新了，过码行为还是老的」，用户只能自己猜要去重启。
+ *
+ * 更麻烦的是**孤儿进程**：插件用 `unref()` 把 Python 子进程从事件循环里
+ * 摘掉（不摘的话云崽关不掉，见 `ensureRunning` 的注释），代价是
+ * **云崽退出时不会带走它** —— 于是重启云崽后，旧 Python 进程还占着端口，
+ * 新插件拉不起自己的服务，只能用那个旧的。
+ *
+ * 这个函数就是判据：**指纹不一致 = 跑的是旧代码，该把服务换掉**。
+ *
+ * ## 算法必须跟 Python 侧 `server.py:_code_hash()` 完全一致
+ *
+ * 都是：按文件名排序 → 每个文件「文件名 + \0 + 内容 + \0」喂进 sha256 →
+ * 取前 16 位十六进制。只算 `.py` / `.cjs`，不算 `.venv` / `.models` /
+ * `__pycache__`（那些不是代码）。
+ *
+ * 两边**任何一处改动都要同步改**，否则会出现「明明是最新代码却一直重启」
+ * 或「该重启却不重启」。所以这里不做任何「优化」（比如缓存），
+ * 逻辑越笨越不容易漂。
+ *
+ * @returns {string} 16 位十六进制指纹；读不到文件时返回空串
+ */
+function diskCodeHash() {
+  try {
+    const names = fs
+      .readdirSync(SERVICE_DIR)
+      .filter(n => (n.endsWith(".py") || n.endsWith(".cjs")) && !n.startsWith("."))
+      .sort()
+    const hash = crypto.createHash("sha256")
+    for (const name of names) {
+      hash.update(name, "utf8")
+      hash.update("\0", "utf8")
+      try {
+        hash.update(fs.readFileSync(path.join(SERVICE_DIR, name)))
+      } catch {
+        hash.update("<unreadable>", "utf8")
+      }
+      hash.update("\0", "utf8")
+    }
+    return hash.digest("hex").slice(0, 16)
+  } catch {
+    return ""
+  }
+}
+
+/**
+ * 问正在跑的服务：你跑的是哪份代码？
+ *
+ * @returns {Promise<string>} 服务报的 codeHash；老版本服务没有这个字段时返回空串
+ */
+async function runningCodeHash(baseUrl, timeout = 3000) {
+  const info = await health(baseUrl, timeout)
+  return String(info?.env?.codeHash || "")
+}
+
+/**
+ * 确认 `/health` 回话的是**我们自己的过码服务**，不是端口上别的什么程序。
+ *
+ * 为什么要校验：`health()` 只判断「有没有 JSON 回话」，而
+ * `restartService()` 会**杀进程** —— 万一 8767 被别的程序占了
+ * （用户改了端口、或另一个插件用了同一个端口），
+ * 不校验就会把无辜的进程杀掉。
+ *
+ * ## 两种历史形态都要认（这是「换掉旧服务」的前提）
+ *
+ * 服务自己的 `/health` 结构变过：
+ *
+ *   ① 早期版本：**扁平**的，`{status, ok, fail, rounds, total_s, successRate, avgSeconds, avgRounds}`
+ *   ② 当前版本：多一个 `env`，里面有 `tdcServer` / `deps` / `codeHash` / `pid`
+ *
+ * ⚠️ **恰恰是①最需要被认出来** —— 它是「旧服务」，而
+ * 「把旧服务换掉」这个功能只发生在旧服务身上。只认②的话，
+ * 遇到①会判成「不是我们的服务」直接跳过，等于这个功能对最该修的情况失效。
+ *
+ * 判据取各版本都稳定存在的字段：`status === "ok"` 且带
+ * `successRate` + `avgRounds` + `rounds` —— 这个组合足够独特，
+ * 不会跟碰巧占了同端口的别的程序混淆。
+ */
+function isOurService(alive) {
+  if (!alive || typeof alive !== "object") return false
+
+  // ② 有 env：看服务特有字段
+  const env = alive.env
+  if (env && typeof env === "object") {
+    if ("tdcServer" in env || "deps" in env || "codeHash" in env) return true
+  }
+
+  // ① 扁平形态：状态统计的组合
+  return (
+    alive.status === "ok" &&
+    "successRate" in alive &&
+    "avgRounds" in alive &&
+    "rounds" in alive
+  )
+}
+
+/**
+ * 按端口找占用它的进程 PID。
+ *
+ * ## 为什么需要它（2026-10-08 用户报修的延伸）
+ *
+ * 新版服务的 `/health` 里有 `pid`，直接拿来杀就行。但**旧版服务没有这个字段**
+ * —— 而「把旧服务换掉」恰恰是最需要它的场景（鸡生蛋）。
+ * 所以这里退一步：从操作系统层面问「谁占着这个端口」。
+ *
+ * 只用系统自带命令，不引入依赖：
+ *   · Linux  `ss -ltnpH` → 失败退 `lsof -ti` → 再退 `fuser`
+ *   · Windows `netstat -ano` 取 LISTENING 行的最后一列
+ *
+ * @returns {number} PID；找不到返回 0
+ */
+function findPidOnPort(port) {
+  const p = String(port || "").trim()
+  if (!/^\d+$/.test(p)) return 0
+
+  const isWin = process.platform === "win32"
+
+  if (isWin) {
+    const r = spawnSync("netstat", ["-ano", "-p", "tcp"], {
+      encoding: "utf8",
+      timeout: 10000,
+      windowsHide: true,
+    })
+    if (r.status !== 0 && !r.stdout) return 0
+    // 形如：  TCP    127.0.0.1:8767    0.0.0.0:0    LISTENING    12345
+    for (const line of String(r.stdout || "").split(/\r?\n/)) {
+      if (!/LISTENING/i.test(line)) continue
+      const cols = line.trim().split(/\s+/)
+      if (cols.length < 4) continue
+      const local = cols[1] || ""
+      // 只比对端口，避免 `:18767` 被 `:8767` 误命中
+      if (!local.endsWith(`:${p}`)) continue
+      const pid = Number(cols[cols.length - 1])
+      if (Number.isInteger(pid) && pid > 0) return pid
+    }
+    return 0
+  }
+
+  // Linux：优先 ss（iproute2，几乎都有），从 `users:(("python",pid=123,fd=4))` 抓 pid
+  const attempts = [
+    ["ss", ["-ltnpH", `sport = :${p}`]],
+    ["lsof", ["-ti", `tcp:${p}`, "-s", "TCP:LISTEN"]],
+    ["fuser", [`${p}/tcp`]],
+  ]
+  for (const [cmd, args] of attempts) {
+    const r = spawnSync(cmd, args, { encoding: "utf8", timeout: 10000 })
+    const out = String(r.stdout || "") + String(r.stderr || "")
+    if (!out.trim()) continue
+    const m = out.match(/pid=(\d+)/) // ss
+    if (m) return Number(m[1])
+    const first = out.trim().split(/\s+/).find(s => /^\d+$/.test(s)) // lsof / fuser
+    if (first) return Number(first)
+  }
+  return 0
+}
+
+/**
+ * 拿某个 PID 的命令行，用来确认「这个进程确实是我们的过码服务」。
+ *
+ * 找不到命令（权限不足 / 进程已退出）时返回空串 —— 调用方按「不确认」处理。
+ */
+function processCommandLine(pid) {
+  if (!pid) return ""
+  if (process.platform === "win32") {
+    // wmic 在新版 Windows 已弃用，用 PowerShell 的 CIM（Win8+ 都有）
+    const r = spawnSync(
+      "powershell",
+      ["-NoProfile", "-NonInteractive", "-Command",
+       `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`],
+      { encoding: "utf8", timeout: 10000, windowsHide: true },
+    )
+    return String(r.stdout || "").trim()
+  }
+  const r = spawnSync("ps", ["-p", String(pid), "-o", "args="], {
+    encoding: "utf8",
+    timeout: 10000,
+  })
+  return String(r.stdout || "").trim()
+}
+
+/**
+ * 服务进程退出（好让插件用新代码重新拉起）。
+ *
+ * 老版本服务没有 `/shutdown`，会返回 404 —— 那种情况下返回 false，
+ * 由调用方决定要不要退化成「按 PID 杀」。
+ *
+ * @returns {Promise<boolean>} 是否成功让它退出
+ */
+async function shutdownService(baseUrl, timeout = 5000) {
+  const base = String(baseUrl || "").replace(/\/+$/, "")
+  if (!base) return false
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeout)
+  try {
+    const res = await fetch(`${base}/shutdown`, { signal: controller.signal })
+    // 404 = 旧版服务没这个端点，算失败
+    return res.ok
+  } catch {
+    // 服务收到请求后立刻退出时，连接可能被重置 —— 这其实也是「成功」的迹象，
+    // 但不能确定，所以交给调用方用「等它真的不响应了」来确认。
+    return false
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
+ * 等到服务真的不响应了（最多等 seconds 秒）。
+ *
+ * @returns {Promise<boolean>} 是否确认已停
+ */
+async function waitStopped(baseUrl, seconds = 10) {
+  const deadline = Date.now() + seconds * 1000
+  while (Date.now() < deadline) {
+    if (!(await health(baseUrl, 1500))) return true
+    await new Promise(r => setTimeout(r, 400))
+  }
+  return false
 }
 
 /** 等服务就绪（轮询健康检查） */
@@ -747,12 +1006,129 @@ let child = null
 let starting = null
 
 /**
- * 确保服务在跑。
+ * 磁盘上的代码有没有「报版本指纹」的能力。
  *
- * @returns {Promise<{ok:boolean, started?:boolean, error?:string}>}
+ * 判据就是 `server.py` 里有没有 `_code_hash` 这个定义。
+ *
+ * ## 为什么需要它（鸡生蛋问题）
+ *
+ * 「服务该不该换掉」要比对两个指纹，而**旧版服务根本报不出指纹**。
+ * 光看「拿不到指纹」不能下结论 —— 那可能是：
+ *   (a) 磁盘上是新版代码、跑着的是旧进程  → **该重启**（正是用户的场景）
+ *   (b) 磁盘上本来就是旧版代码            → 不该重启（旧插件也不会走到这儿）
+ *
+ * 用「磁盘代码有没有这个能力」就能分开：**磁盘有、服务报不出 → 必是 (a)**。
+ * 这个判据比「看服务版本号」更可靠，因为不依赖任何约定好的字段值。
+ */
+function diskSupportsCodeHash() {
+  try {
+    const src = fs.readFileSync(SERVER_PY, "utf8")
+    return src.includes("_code_hash")
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 防死循环：同一个地址短时间内因版本问题重启过几次。
+ *
+ * 正常情况重启一次就好了（新进程必然报得出指纹）。但如果**新进程也报不出**
+ * （比如磁盘上的代码被改坏、或者端口上其实是别的程序），
+ * 没有这个闸门就会「重启 → 还是旧 → 再重启」无限转。
+ */
+const restartGuard = new Map()
+const RESTART_GUARD_LIMIT = 3
+const RESTART_GUARD_WINDOW = 5 * 60 * 1000
+
+function guardAllowsRestart(baseUrl) {
+  const key = String(baseUrl || "")
+  const now = Date.now()
+  const hits = (restartGuard.get(key) || []).filter(t => now - t < RESTART_GUARD_WINDOW)
+  if (hits.length >= RESTART_GUARD_LIMIT) {
+    restartGuard.set(key, hits)
+    return false
+  }
+  hits.push(now)
+  restartGuard.set(key, hits)
+  return true
+}
+
+/**
+ * 确保服务在跑，且**跑的是磁盘上这份代码**。
+ *
+ * ## 为什么要比对代码指纹（2026-10-08 用户报修）
+ *
+ * 原来第一句是「`health()` 通就复用」，于是：
+ *
+ *     用户 git pull / #更新 更新插件 → 磁盘上 .py 是新的
+ *     但 Python 进程还在内存里跑旧代码
+ *     → ensureRunning 看到「服务活着」就复用
+ *     → 过码行为还是老的，用户以为「更新没生效」
+ *
+ * 所以现在多一步：拿磁盘指纹跟服务 `/health` 报的指纹比。
+ * **不一致就把它换掉**（优雅退出 + 重新拉起），不用用户自己想办法重启。
+ *
+ * ## 孤儿进程是这件事的放大器
+ *
+ * 插件用 `unref()` 把 Python 子进程从事件循环里摘掉（不摘云崽关不掉），
+ * 代价是**云崽退出时不会带走它**。于是重启云崽后旧 Python 还占着端口，
+ * 新插件拉不起自己的服务，只能用那个旧的 —— 而且旧进程**没有父进程管**，
+ * 不主动清理就会一直留着。这里正好一并解决。
+ *
+ * @returns {Promise<{ok:boolean, started?:boolean, restarted?:boolean, error?:string}>}
  */
 export async function ensureRunning({ baseUrl, port, logger, rounds } = {}) {
-  if (await health(baseUrl)) return { ok: true, started: false }
+  const alive = await health(baseUrl)
+
+  if (alive) {
+    // 端口上必须**确实是我们自己的服务**才敢做版本判断和重启 ——
+    // 万一被别的程序占了，重启就等于杀无辜进程。
+    if (!isOurService(alive)) {
+      logger?.warn?.(
+        `${baseUrl} 上有程序在响应，但不是过码服务（端口被占用？），不做处理`,
+      )
+      return { ok: true, started: false }
+    }
+
+    const running = String(alive?.env?.codeHash || "")
+    const disk = diskCodeHash()
+    const diskKnowsHash = diskSupportsCodeHash()
+
+    // 什么情况算「跑的是旧代码」：
+    //   ① 两边都有指纹且不一致        → 代码改过了
+    //   ② 磁盘代码有指纹能力、服务报不出 → 服务是旧版本（用户的场景）
+    const stale = diskKnowsHash && disk && (!running || running !== disk)
+
+    if (!stale) {
+      if (diskKnowsHash && !running) {
+        logger?.debug?.("服务没报 codeHash，但磁盘代码也没有该能力，不做版本比对")
+      }
+      return { ok: true, started: false }
+    }
+
+    if (!guardAllowsRestart(baseUrl)) {
+      logger?.warn?.(
+        `过码服务反复跑旧代码（已重启 ${RESTART_GUARD_LIMIT} 次），先不重启了。` +
+        "发 #滑块过码重启 手动试一次，或重启云崽",
+      )
+      return { ok: true, started: false }
+    }
+
+    logger?.info?.(
+      running
+        ? `过码服务跑的是旧代码（${running} → ${disk}），正在重启以加载新版本…`
+        : "过码服务是旧版本（报不出代码指纹），正在重启以加载新版本…",
+    )
+    const stopped = await restartService({ baseUrl, logger, port })
+    if (!stopped) {
+      return {
+        ok: false,
+        error: "过码服务代码已更新，但旧进程停不掉（请发 #重启 或重启云崽）",
+      }
+    }
+    // 停掉后往下走正常的「拉起来」流程
+  }
+
   // 并发调用只拉一次
   if (starting) return starting
 
@@ -805,6 +1181,90 @@ export async function ensureRunning({ baseUrl, port, logger, rounds } = {}) {
     }
   })()
   return starting
+}
+
+/**
+ * 把服务换掉：先请它自己优雅退出，不行再强杀，最后确认端口真的空出来。
+ *
+ * 四种情况都要处理：
+ *   ① 服务是我们拉起来的 → 手上有 `child` 句柄，`stopService()` 能干净收摊
+ *   ② 服务是**孤儿进程**（上次云崽留下的，`unref` 的代价）→ 走 `/shutdown`
+ *   ③ 新版服务能报 `pid` → 直接按 PID 杀
+ *   ④ **旧版服务既没 `/shutdown` 也没 `pid`**（鸡生蛋）→ 从端口反查 PID
+ *
+ * ④ 是最要紧的一条：**「把旧服务换掉」恰恰只发生在旧服务身上**，
+ * 而旧服务正好什么信息都不给。所以这里退到操作系统层面问「谁占着这个端口」。
+ *
+ * @returns {Promise<boolean>} 是否确认已停
+ */
+export async function restartService({ baseUrl, logger, port } = {}) {
+  const before = await health(baseUrl, 2500)
+  if (!before) return true // 本来就没跑
+
+  // 不是我们的服务就别动 —— 杀了就是误伤别人的进程
+  if (!isOurService(before)) {
+    logger?.warn?.(`${baseUrl} 上的程序不是过码服务，不重启它`)
+    return true
+  }
+
+  // ① 我们自己拉起来的：走标准收摊（它会等 stdio 关干净）
+  if (child) {
+    logger?.info?.("停掉本插件拉起的过码服务…")
+    if (await stopService()) return true
+  }
+
+  // ② /shutdown（新版服务提供）
+  logger?.info?.("请求过码服务退出（/shutdown）…")
+  if (await shutdownService(baseUrl)) {
+    if (await waitStopped(baseUrl, 10)) return true
+  } else {
+    logger?.debug?.("服务没有 /shutdown（旧版本），改用 PID 结束它")
+  }
+
+  // ③ 新版 /health 里有 pid；④ 旧版没有就从端口反查
+  let pid = Number(before?.env?.pid || 0)
+  let how = "服务上报"
+  if (!(pid > 0)) {
+    let portNum = port
+    if (!portNum) {
+      try {
+        portNum = new URL(baseUrl).port
+      } catch {
+        portNum = ""
+      }
+    }
+    pid = findPidOnPort(portNum || 8767)
+    how = "端口反查"
+  }
+
+  if (pid > 0 && pid !== process.pid) {
+    // 杀之前确认这个进程确实是过码服务（端口反查可能查到别的程序）
+    const cmdline = processCommandLine(pid)
+    const looksOurs = !cmdline || /server\.py|QQSlider/i.test(cmdline)
+    if (!looksOurs) {
+      logger?.warn?.(`PID ${pid} 占着端口但不是过码服务，不杀它：${cmdline.slice(0, 120)}`)
+      return false
+    }
+
+    logger?.warn?.(`结束过码服务（PID ${pid}，来源：${how}）`)
+    try {
+      process.kill(pid, "SIGTERM")
+    } catch (err) {
+      logger?.debug?.(`kill ${pid} 失败：${err?.message || err}`)
+    }
+    if (await waitStopped(baseUrl, 8)) return true
+
+    logger?.warn?.(`PID ${pid} 没响应 SIGTERM，强制结束`)
+    try {
+      process.kill(pid, "SIGKILL")
+    } catch {
+      /* 已经没了 */
+    }
+    if (await waitStopped(baseUrl, 5)) return true
+  }
+
+  logger?.warn?.("过码服务停不掉，端口可能被别的进程占着")
+  return false
 }
 
 /**
