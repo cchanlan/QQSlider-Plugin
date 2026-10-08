@@ -302,6 +302,14 @@ def _solve_click_variant(solver, kind: str) -> dict:
     # ec=9（verifyFailRefresh）时换题重试几次。默认 3 次；
     # 每次都要重新 prehandle + 重新识别，所以别开太大。
     refresh_attempts = int(os.environ.get("QQ_SLIDER_CLICK_REFRESH", "3"))
+    # ec=51/30（verifyHybrid）时带 sess 续做几次。默认 5 次。
+    # ★ 点选第一题**必返 51**，续做那一轮才是多选题、才可能拿到 ticket，
+    #   所以这个预算不能小（小于 2 就等于永远过不去）。
+    hybrid_attempts = int(os.environ.get("QQ_SLIDER_CLICK_HYBRID", "5"))
+    # 「断崖太小、这张认不出」时在同一流程内重摇几次。默认 8。
+    # ★ 单独一份额度：这类题（典型「包含文字：X」）实测约占多选的 1/3，
+    #   并进 refresh 额度会挤掉能认出的题的机会。
+    max_unrecognized = int(os.environ.get("QQ_SLIDER_CLICK_REROLL", "8"))
     try:
         rec = click_recognizer.get_recognizer(top_k=top_k)
     except Exception as err:  # noqa: BLE001
@@ -309,7 +317,9 @@ def _solve_click_variant(solver, kind: str) -> dict:
 
     try:
         return click_solver.solve_click(solver, recognizer=rec, top_k=top_k,
-                                        refresh_attempts=refresh_attempts)
+                                        refresh_attempts=refresh_attempts,
+                                        hybrid_attempts=hybrid_attempts,
+                                        max_unrecognized=max_unrecognized)
     except click_solver.ClickNotSupported as err:
         # 模型没装好 → 真正回落到纯 CV（准确率约 48%，但总比直接失败好）
         return _solve_click_cv_fallback(solver, rec, err)

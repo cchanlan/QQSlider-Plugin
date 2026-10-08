@@ -73,6 +73,50 @@ _STD = np.array([0.26862954, 0.26130258, 0.27577711], np.float32).reshape(1, 3, 
 DEFAULT_TOP_K = 3
 
 
+def otsu_split(scores, min_k: int = 1, max_k: int | None = None):
+    """按 1-D Otsu（类间方差最大）把分数切成「高分簇 / 低分簇」。
+
+    ## 为什么需要它
+
+    点选有两种题面（`json_payload.lang_headers` 里写着）：
+
+        zh-cn = "选择$最$符合描述的图片"      # 单数 → 选 1 格
+        zh-cn = "选择$%所有%$符合描述的图片"  # 复数 → 选**所有**符合的格
+
+    第二种是「多选」，**正解格数不固定**（实测 2~4 格都有）。所以不能用
+    「固定选前 k 格」——少选一格就是错（实测连续 15 次全错都是这个原因）。
+
+    真正的信号是**分数的断层**：符合描述的格子分数明显高一档。
+    但「相邻两格最大差值」不稳（末尾那个离群低分格会抢走最大间隔，
+    实测会把 4 格切成 5 格），而 **Otsu 看的是两类的类间方差，
+    不会被单个离群值带偏** —— 实测同一个题目用最大间隔切 k=5（错）、
+    用 Otsu 切 k=4（对）。
+
+    @returns `(选中的 0-based 下标列表, 类间方差, 断点 k)`
+        类间方差同时是个**置信度**：正常多选实测 55~170，
+        而「包含文字：X」那种认不出来的题只有 0.3 左右 —— 差两个数量级，
+        可以据此判断「这题没把握」，交给上层换题重试。
+    """
+    n = len(scores)
+    if n <= 1:
+        return list(range(n)), 0.0, n
+    order = sorted(range(n), key=lambda i: -float(scores[i]))
+    s = [float(scores[i]) for i in order]
+    if max_k is None:
+        max_k = n - 1
+    lo = max(1, int(min_k))
+    hi = min(int(max_k), n - 1)
+    best_bcv, best_k = -1.0, lo
+    for k in range(lo, hi + 1):
+        m_hi = sum(s[:k]) / k
+        m_lo = sum(s[k:]) / (n - k)
+        # 两类权重 × 均值差的平方（Otsu 的类间方差，常数项略去）
+        bcv = (k / n) * ((n - k) / n) * (m_hi - m_lo) ** 2
+        if bcv > best_bcv:
+            best_bcv, best_k = bcv, k
+    return order[:best_k], best_bcv, best_k
+
+
 class ClickSolverError(RuntimeError):
     """点选识别的基类错误。"""
 
@@ -305,6 +349,51 @@ class ClickRecognizer:
             "scores": [float(s) for s in scores],
             "margin": margin,
             "seconds": round(time.perf_counter() - started, 2),
+        }
+
+    def recognize_multi(self, image_bytes: bytes, instruction: str, regions,
+                        min_k: int = 1, max_k: int | None = None) -> dict:
+        """多选题识别：给**全 6 格**打分，再按 Otsu 断层切出「符合描述」的那一簇。
+
+        和 `recognize` 的区别有两个，都不能省：
+
+        1. **不做 CV 预筛**。预筛是按「谁最离群」砍到 3 格，那是为
+           「单选、找一个异类」设计的；多选题正解可能有 4 格，
+           预筛会把其中一格直接丢掉 —— 丢一格就必错。
+        2. **不取 argmax，取高分簇**。多选要交的是**一整簇**。
+
+        @returns {ok, pick_indices, picks, k, separation, scores, margin, seconds}
+        """
+        label = str(instruction or "").strip().strip("\u201c\u201d\"' ")
+        if not label:
+            raise ClickSolverError("题面为空，无法识别")
+        if not regions:
+            raise ClickSolverError("没有格子坐标")
+
+        started = time.perf_counter()
+        img = Image.open(__import__("io").BytesIO(image_bytes)).convert("RGB")
+
+        self.load()
+        idx = list(range(len(regions)))
+        with self._lock:
+            scores = self._clip_scores(img, regions, idx, label)
+
+        picks, bcv, k = otsu_split(scores, min_k=min_k, max_k=max_k)
+        order = sorted(range(len(scores)), key=lambda i: -float(scores[i]))
+        margin = (float(scores[order[0]] - scores[order[1]])) if len(order) > 1 else float("inf")
+
+        return {
+            "ok": True,
+            "pick_indices": [int(i) for i in picks],
+            "pick_index": int(picks[0]),                 # 兼容单选调用方
+            "picks": [int(i) + 1 for i in picks],        # 1-based，方便人看
+            "k": int(k),
+            "separation": float(bcv),
+            "scores": [float(v) for v in scores],
+            "ordered": [int(i) + 1 for i in order],
+            "margin": margin,
+            "seconds": round(time.perf_counter() - started, 2),
+            "solver": "local-clip-multi",
         }
 
     def recognize_cv_only(self, image_bytes: bytes, regions) -> dict:

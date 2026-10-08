@@ -1048,7 +1048,34 @@ class SlideSolver:
         self._session_warmed = True
         self._needs_light_warm = False
 
-    def prehandle(self) -> dict[str, Any]:
+    def prehandle(self, sess: str = "") -> dict[str, Any]:
+        """拿一道题。
+
+        @param sess
+            **续做用的会话**（默认空 = 开一道全新题）。
+
+            ⚠️ 这个参数不是可选的装饰，是腾讯混合验证流程的关键（2026-10-08 扒源码确认）：
+
+            ```js
+            // tcaptcha-frame.js —— 内层报 hybrid 时外层这么处理
+            e.prototype.onHybridVerify = function (e, t) {
+              this.clearContainerAndEl(), this.preCreate(e)   // 带着 sess 重建
+            }
+            e.prototype.getPreHandleNew = function (e) {
+              g({ url: ..., data: { sess: e.sess || "", ... },   // sess 回传
+                  success: function (i) {
+                    if (i.ticket) ...onSuccess(...)      // 也可能直接给 ticket
+                    if (217 === i.state) ...preHandleRateLimit()
+                  }})
+            }
+            e.prototype.startPreHandle = function (e) { this.getPreHandleNew({ sess: e, ... }) }
+            ```
+
+            实测：verify 返回 `errorCode=51` 时响应里带一个**新 sess**，
+            拿它当 `sess` 参数重新 prehandle，**能拿到下一道题**，
+            而且全程 `sid` 不变（风控指纹连续，更像真人）。
+            不带 sess 就是另开一道全新题，等于放弃了服务端给的续做机会。
+        """
         # Warm once per HTTP session. Re-fetching captcha assets every challenge
         # multiplies pure-protocol heat under continuous 2s solves.
         self._warm_session(force=False)
@@ -1058,6 +1085,8 @@ class SlideSolver:
             params = self._prehandle_params_qq()
         else:
             params = self._prehandle_params_cloud()
+        if sess:
+            params["sess"] = sess
         response = self._get(
             self.endpoints.prehandle_url,
             headers=self._fetch_headers(
