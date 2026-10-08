@@ -332,11 +332,18 @@ def solve_once(
         "aid": aid,
         "cap_cd": cap_cd,
         "kind": kind,
-        "solver": "local",
+        "solver": result.get("solver") or "local",
     }
 
+    # 点选特有的诊断字段：题面、选中的格子、候选、置信度、用的是哪种提交格式。
+    # **必须显式透传** —— 上面那个 payload 是重新拼的，不带上就在这里丢了，
+    # 排查时只看得到 errorCode，完全不知道识别结果对不对。
+    for key in ("instruction", "pick", "candidates", "margin", "ans_format", "cv_rank"):
+        if key in result:
+            payload[key] = result[key]
+
     # 题型不是滑块时，可选回落到第三方（默认关闭，见 FALLBACK_URL）
-    if not ok and kind != "slide" and FALLBACK_URL:
+    if not ok and kind not in ("slide", "click") and FALLBACK_URL:
         fb = _fallback_solve(url=url, uin=uin)
         if fb.get("ok"):
             payload.update(fb)
