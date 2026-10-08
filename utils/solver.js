@@ -59,8 +59,13 @@ export async function solveSlider({
 
   if (!data.ok || !data.ticket) {
     const why = data.error || `errorCode=${data.errorCode}`
-    if (data.kind && data.kind !== "slide") {
-      throw new Error(`服务端下发的是「${data.kind}」题型，本方案只解滑块：${why}`)
+    const kind = data.kind || "slide"
+    if (kind === "click" || kind === "icon") {
+      // 点选/图标点选走本地 CLIP 识别（模型没装好时服务会给出具体原因）
+      throw new Error(`「${kind === "icon" ? "图标点选" : "点选"}」题型过码失败：${why}`)
+    }
+    if (kind !== "slide") {
+      throw new Error(`服务端下发的是「${kind}」题型，只支持滑块与点选：${why}`)
     }
     throw new Error(`过码失败：${why}`)
   }

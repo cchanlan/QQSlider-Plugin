@@ -185,13 +185,54 @@ def _env_probe() -> dict:
             deps[name] = True
         except Exception:
             deps[name] = False
-    return {
+    info = {
         "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
         "node": _shutil.which(node_cmd) or None,
         "nodeCommand": node_cmd,
         "deps": deps,
         "tdcServer": TDC_SERVER.name,
     }
+    # 点选识别能力（只看模型文件在不在，不载模型 —— 载入要 0.9s，太重）
+    try:
+        import click_recognizer as _cr
+
+        info["click"] = _cr.recognizer_status()
+    except Exception as err:  # noqa: BLE001
+        info["click"] = {"available": False, "reason": f"{type(err).__name__}: {err}"}
+    return info
+
+
+def _solve_click_variant(solver, kind: str) -> dict:
+    """点选题型的解题入口。
+
+    走本地 CLIP 识别（见 `click_recognizer` + `click_solver`）。
+    识别不了时返回和滑块一致的失败结构，让上层统一处理。
+    """
+    if kind != "click":
+        return {"errorCode": "-1",
+                "errMessage": f"服务端下发的是「{kind}」题型，目前只支持滑块与点选"}
+
+    try:
+        import click_recognizer
+        import click_solver
+    except ImportError as err:
+        return {"errorCode": "-1", "errMessage": f"点选模块不可用：{err}"}
+
+    top_k = int(os.environ.get("QQ_SLIDER_CLICK_TOPK", "3"))
+    try:
+        rec = click_recognizer.get_recognizer(top_k=top_k)
+    except Exception as err:  # noqa: BLE001
+        return {"errorCode": "-1", "errMessage": f"点选识别器初始化失败：{err}"}
+
+    try:
+        return click_solver.solve_click(solver, recognizer=rec, top_k=top_k)
+    except click_solver.ClickNotSupported as err:
+        # 模型没装好 → 退回纯 CV（准确率低但不至于整个失败）
+        LOG.warning("CLIP 不可用，回落纯 CV：%s", err)
+        return {"errorCode": "-1", "errMessage": str(err), "solver": "cv_fallback"}
+    except Exception as err:  # noqa: BLE001
+        LOG.exception("点选解题异常")
+        return {"errorCode": "-1", "errMessage": f"{type(err).__name__}: {err}"}
 
 
 def parse_slider_url(url: str) -> dict:
@@ -267,12 +308,11 @@ def solve_once(
                 solver.qq_extra_params = dict(extra)
             result = solver.solve(retries=rounds)
         except UnsupportedCaptchaKind as err:
-            # 服务端下发的是点选/图标点选 —— 本引擎（滑块专用）解不了。
-            # 不重试：题型由 uin + cap_cd 决定，重试同样参数只会得到同样题型。
+            # 服务端下发的不是滑块 → 交给点选流程（本地 CLIP 识别）
             kind = "click" if "click" in str(err) else "other"
-            result = {"errorCode": "-1", "errMessage": str(err)}
-            LOG.warning("题型不支持: %s", err)
-            # 题型不对说明这个会话已无价值，换一个（只丢这个 key，别动另一个端点）
+            LOG.info("题型不是滑块（%s），转点选识别", kind)
+            result = _solve_click_variant(solver, kind)
+            # 点选走的是另一套会话消费方式，这个 solver 的滑块会话已无用
             _drop_solver(endpoints, aid_int)
         except Exception:
             # 其它异常可能是会话被污染（ec=12 之类），下次换新会话更稳

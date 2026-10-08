@@ -1,15 +1,45 @@
 # QQSlider-Plugin
 
-**QQ 滑块自动过码** —— 云崽登录遇到滑块验证时自动通过，不用再手点。
+**QQ 登录验证自动过码** —— 云崽登录时遇到滑块、点选验证自动通过，不用再手点。
 
-纯 HTTP 协议实现，**零浏览器、零人工**，单次约 2~3 秒。
+纯 HTTP 协议 + 本地模型，**零浏览器、零外部服务**。滑块约 2~3 秒，点选约 5 秒。
 
 ## 它解决什么
 
-用 icqq 登录 QQ 时，腾讯会弹一个滑块验证（`system.login.slider`）。
+用 icqq 登录 QQ 时，腾讯会弹验证（`system.login.slider`），题型有两种：
+
+| 题型 | 长什么样 | 怎么过 |
+|---|---|---|
+| **滑块** | 拖滑块把拼图对上缺口 | OpenCV 找缺口 + 拟人轨迹 |
+| **点选** | 「选出最符合描述的图片：百香果」6 选 1 | **本地 CLIP 模型看图**（见下） |
+
 原版 ICQQ-Plugin 会让你在 QQ 里手选验证方式、再手动拖滑块或者去第三方站点过码。
 
-装上本插件后：**遇到滑块自动过，你什么都不用做。**
+装上本插件后：**两种都自动过，你什么都不用做。**
+
+### 点选是怎么过的
+
+腾讯的点选协议里**只有题面，没有答案**（实测 60 张真题确认）：
+
+    instruction = "百香果"                       # 题面，就这个
+    select_region_list = [{"id":1,"range":[0,34,220,254]}, ...]   # 纯坐标，无任何标记
+    prompt_id = 166767                          # 题面编号，与题面一一对应
+    img_url                                     # 随机哈希，不含标签
+
+所以必须**看图**。插件把 **Chinese-CLIP** 模型当普通依赖装到本地，
+纯 CPU 推理，**不连任何外部 AI 服务**。
+
+选型是实测出来的（服务器 N5105 弱 CPU，60 张真题）：
+
+| 方案 | 体积 | 单次 | 准确率 |
+|---|---|---|---|
+| **Chinese-CLIP int8 + CV 预筛** | **182MB** | **1.8s** | **88%** |
+| Chinese-CLIP int8（全 6 格） | 182MB | 3.7s | 88% |
+| MobileCLIP-S0 int8 | 52MB | 1.3s | 29%（英文模型，认不了中文）|
+| 纯 CV 找离群格 | 0 | 10ms | 48% |
+
+> **CV 预筛**：干扰图常是「另一个概念的若干张变体」，所以先按图像特征
+> 挑出 3 个最像异类的格子，再交给 CLIP 打分 —— 耗时砍半，准确率不变。
 
 ## 安装
 
@@ -35,11 +65,15 @@ git clone --depth=1 https://github.com/cchanlan/QQSlider-Plugin.git ./plugins/QQ
 首次加载插件自己会做：
 
 - 创建 Python 虚拟环境、装依赖（后台进行，约 1~3 分钟，**不阻塞云崽启动**）
+- 自动下载点选识别模型（182MB，约 15~70 秒，同样后台）
 - 依赖装好后自动拉起过码服务
-- 之后登录遇到滑块自动过码
+- 之后登录遇到验证自动过码
 
 > 需要机器上有 **Python 3.9+** 和 **Node.js**（云崽本来就要 Node）。
 > 没装 Python 的话，发 `#滑块过码安装` 会提示你。
+>
+> 点选模型下不下来**不影响滑块**：拉不动只是点选题型过不了，
+> 那时会提示你手动过一次。
 
 **支持云崽全生态**：TRSS-Yunzai、Miao-Yunzai、JiuLi 都能直接跑，
 Windows 和 Linux 都能跑。缺什么依赖插件会自己探测、自己装。
@@ -48,8 +82,8 @@ Windows 和 Linux 都能跑。缺什么依赖插件会自己探测、自己装�
 
 | 指令 | 作用 |
 |---|---|
-| `#滑块过码状态` | 看接管状态、服务是否在跑、Python/Node 有没有找到、成功率统计 |
-| `#滑块过码安装` | 手动装依赖并启动服务 |
+| `#滑块过码状态` | 看接管状态、服务在跑没有、Python/Node、点选能不能过、成功率统计 |
+| `#滑块过码安装` | 手动装依赖、下模型并启动服务 |
 | `#滑块过码测试` | 真解一次验证码，确认环境可用 |
 | `#滑块过码开启` / `#滑块过码关闭` | 开关自动过码 |
 
@@ -95,6 +129,8 @@ permission: master    # 指令权限：master / admin / all
 
 ## 它是怎么过码的
 
+### 滑块
+
 | 步骤 | 做什么 |
 |---|---|
 | ① prehandle | 拿 `sess`、图片 URL、pow 配置、`tdc_path` |
@@ -105,6 +141,18 @@ permission: master    # 指令权限：master / admin / all
 | ⑥ pow | 解工作量证明 |
 | ⑦ verify | 提交，拿 ticket |
 
+### 点选
+
+| 步骤 | 做什么 |
+|---|---|
+| ① prehandle | 拿题面 `instruction`、6 格坐标、图片 URL |
+| ② 预筛 | CV 按图像特征挑出 3 个「最像异类」的格子 |
+| ③ 识别 | CLIP 给这 3 格与题面打匹配分，取最高 |
+| ④ 轨迹 | 按格子中心生成点击事件（按下-抬起-点击）|
+| ⑤ 参数 | 把点击事件喂给 `tdc.js`，拿到 `collect` + `eks` |
+| ⑥ pow | 解工作量证明 |
+| ⑦ verify | 提交 `ans`，拿 ticket |
+
 **没有逆向 jsvmp，也没有浏览器** —— `collect`/`eks` 是腾讯自己的 `tdc.js`
 在 Node 的 `vm` 里算出来的，腾讯改算法也不用跟着改。
 
@@ -112,16 +160,18 @@ permission: master    # 指令权限：master / admin / all
 
 ```
 QQSlider-Plugin/
-├── index.js              # 插件入口、指令
+├── index.js               # 插件入口、指令
 ├── utils/
-│   ├── config.js         # 配置加载（三框架自适应 + 兜底）
-│   ├── hook.js           # 滑块事件接管（与 ICQQ-Plugin 的唯一接缝）
-│   ├── service.js        # 服务生命周期（找 Python/建 venv/装依赖/起停）
-│   └── solver.js         # 过码服务客户端
-└── service/              # Python 过码服务
-    ├── server.py         # HTTP 服务
-    ├── slide_solver.py   # 过码引擎
-    ├── tdc_server.cjs    # Node worker（跑腾讯 tdc.js）
+│   ├── config.js          # 配置加载（三框架自适应 + 兜底）
+│   ├── hook.js            # 验证事件接管（与 ICQQ-Plugin 的唯一接缝）
+│   ├── service.js         # 服务生命周期（找 Python/建 venv/装依赖/下模型/起停）
+│   └── solver.js          # 过码服务客户端
+└── service/               # Python 过码服务
+    ├── server.py          # HTTP 服务（/solve 自动判题型）
+    ├── slide_solver.py    # 滑块引擎（缺口识别 + 轨迹 + 协议）
+    ├── click_solver.py    # 点选解题流程（识别 → 生成轨迹 → 提交）
+    ├── click_recognizer.py# 点选识别（CV 预筛 + 本地 CLIP）
+    ├── tdc_server.cjs     # Node worker（跑腾讯 tdc.js）
     └── requirements.txt
 ```
 
@@ -129,7 +179,9 @@ QQSlider-Plugin/
 
 - **Python 3.9+**（Windows 上命令是 `python`，Linux 上是 `python3`，插件会自动探测）
 - **Node.js**（云崽本来就要）
-- Python 依赖：`curl-cffi`、`requests`、`numpy`、`opencv-python`、`Pillow`（插件自动装）
+- Python 依赖：`curl-cffi`、`requests`、`numpy`、`opencv-python`、`Pillow`
+  + 点选用：`onnxruntime`、`tokenizers`（插件自动装）
+- **磁盘**：约 400MB（依赖 + 点选模型 182MB）
 
 ### 依赖会自动装
 
@@ -141,8 +193,9 @@ QQSlider-Plugin/
    免得卡住
 4. 镜像源按 清华 → 阿里 → 官方 依次重试；某个源 90 秒没响应就换下一个
 5. 装完真 `import` 一遍 `cv2`/`numpy` 等，确认能用才算成功
+6. 最后下点选模型（182MB，走 hf-mirror，断了会续传）；**这步失败不算安装失败**
 
-装好后发 `#滑块过码状态` 能直接看到 Python/Node 版本和依赖就绪情况。
+装好后发 `#滑块过码状态` 能直接看到 Python/Node 版本、依赖和点选能力的就绪情况。
 
 ### 换镜像源
 
@@ -157,9 +210,15 @@ set QQSLIDER_PIP_INDEX=https://pypi.org/simple
 
 ## 常见问题
 
-**Q：提示「服务端下发的是 click 题型」？**
-QQ 登录的题型由服务端按 `uin` + `cap_cd` 决定。这个提示说明当前这次验证不是滑块
-（可能是点选）。本插件只解滑块 —— QQ 登录验证正常就是滑块，遇到点选请手动过一次。
+**Q：遇到点选但没过？**
+点选靠本地模型识别。先发 `#滑块过码状态` 看「点选」那行：
+
+- 显示**未就绪** → 模型没下下来，发 `#滑块过码安装` 重试（约 182MB）
+- 显示**可以过**但还是失败 → 看日志里「点选识别：选第 N 格」那行。
+  识别本身很快（约 1.5 秒），慢在协议提交环节
+
+识别准确率实测约 **88%**（60 张真题），遇到干扰图特别刁钻的可能认错，
+这时会自动把验证链接发给你手动过一次。
 
 **Q：服务起不来？**
 发 `#滑块过码状态` 看 Python / Node 有没有找到、依赖装没装上，缺什么会直接列出来。
@@ -169,7 +228,11 @@ QQ 登录的题型由服务端按 `uin` + `cap_cd` 决定。这个提示说明�
 Debian / Ubuntu 上执行 `apt install python3-venv`，然后发 `#滑块过码安装`。
 
 **Q：会不会拖慢云崽启动？**
-不会。装依赖和服务启动都在后台进行，不阻塞启动。过码只在登录遇到滑块时才用到。
+不会。装依赖、下模型和服务启动都在后台进行，不阻塞启动。过码只在登录遇到验证时才用到。
+
+**Q：点选模型占多少资源？**
+磁盘 182MB，载入内存约 1.5GB 峰值，用 4 个 CPU 线程推理约 1.5 秒。
+模型只在真遇到点选时才载入（载入本身约 0.9 秒）。
 
 **Q：能解极验（米游社那种）吗？**
 不能。腾讯 TCaptcha 和极验是两套完全不同的协议。
@@ -180,6 +243,10 @@ Debian / Ubuntu 上执行 `apt install python3-venv`，然后发 `#滑块过码�
 做了三处改造：端点参数化（腾讯云 / QQ 两套可切）、关闭上游的「降热」机制
 （它会在连续成功 3 次后故意全错，服务化时是功能损坏）、常驻复用
 （单次从 7 秒压到 2~3 秒）。
+
+点选识别用的是 [Chinese-CLIP](https://github.com/OFA-Sys/Chinese-CLIP)
+（ONNX 版由 [Xenova](https://huggingface.co/Xenova/chinese-clip-vit-base-patch16) 转换），
+**纯本地 CPU 推理**，不经过任何外部服务。
 
 ## License
 

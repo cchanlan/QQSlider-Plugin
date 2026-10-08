@@ -7,6 +7,10 @@ __pycache__/
 # 依赖校验标记
 service/.venv/.deps-ok
 
+# 点选识别模型（182MB，插件首次运行自己下）
+service/.models/
+*.part
+
 # 编辑器 / 系统
 .vscode/
 .idea/

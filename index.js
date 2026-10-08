@@ -114,6 +114,13 @@ export class QQSlider extends plugin {
       `Python：${s.env?.python || "未找到"}`,
       `Node：${s.env?.node || "未找到"}`,
     ]
+    // 点选识别能力：查服务报回来的模型状态
+    const click = s.health?.env?.click
+    if (click) {
+      lines.push(
+        `点选：${click.modelReady ? `可以过（识别模型 ${click.modelMB}MB）` : "未就绪（发 #滑块过码安装）"}`,
+      )
+    }
     if (s.env?.missing?.length) lines.push(`缺少：${s.env.missing.join("、")}`)
     if (s.health) {
       lines.push(

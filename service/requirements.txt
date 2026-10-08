@@ -1,5 +1,12 @@
+# 滑块过码所需（必需）
 curl-cffi>=0.15,<1
 requests>=2.31,<3
 numpy>=1.26,<3
 opencv-python>=4.8,<5
 Pillow>=10,<13
+
+# 点选识别所需（可选：装不上只影响点选题型，滑块照常）
+# onnxruntime：跑 CLIP 模型（CPU 推理）。Linux/macOS/Windows 都有预编译 wheel。
+onnxruntime>=1.17,<2
+# tokenizers：中文分词（Chinese-CLIP 的配套）
+tokenizers>=0.15,<1

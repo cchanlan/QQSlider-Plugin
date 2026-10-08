@@ -380,9 +380,51 @@ export async function installDeps({ logger, force = false } = {}) {
     return { ok: false, error: `依赖校验失败：${tail(check.out, 300)}。${FIX_HINT}` }
   }
 
+  // ── 5. 点选识别模型（可选）：装不上不影响滑块 ─────────────────────────
+  await ensureClickModel({ logger })
+
   await fsp.writeFile(READY_FLAG, new Date().toISOString(), "utf8")
   log("Python 环境就绪")
   return { ok: true }
+}
+
+/**
+ * 下载「点选识别」用的 CLIP 模型（约 182MB）。
+ *
+ * **失败不算错**：模型只影响点选题型，滑块完全不需要它。
+ * 所以这里只提示，不阻断安装 —— 用户装不上也不该连滑块都用不了。
+ */
+export async function ensureClickModel({ logger, force = false } = {}) {
+  const log = m => logger?.info?.(m)
+  const py = venvPython()
+  if (!fs.existsSync(py)) return false
+
+  const code = [
+    "import sys",
+    "sys.path.insert(0, sys.argv[1])",
+    "import click_recognizer as cr",
+    "ok = cr.ensure_model()",
+    "print('click-model-ready' if ok else 'click-model-failed')",
+  ].join("\n")
+
+  // 下载 182MB，给足时间；静默超时防止网络僵死
+  const r = await run(py, ["-c", code, SERVICE_DIR], {
+    logger,
+    timeout: 900000,
+    silenceTimeout: 120000,
+    onLine: m => {
+      if (/已下载|下载/.test(m)) log(m)
+      else logger?.debug?.(m)
+    },
+  })
+
+  const ok = r.out.includes("click-model-ready")
+  if (!ok) {
+    log("点选识别模型没装上（不影响滑块），登录遇到点选时可发 #滑块过码安装 重试")
+  } else {
+    log("点选识别模型就绪")
+  }
+  return ok
 }
 
 /** 健康检查 */
