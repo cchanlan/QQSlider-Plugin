@@ -57,23 +57,29 @@ class ClickNotSupported(ClickSolveError):
 # 依据：滑块用的是 [{"elem_id":1,"type":"DynAnswerType_POS","data":"x,y"}]，
 # 点选是同一个 ans 容器，只是 type 换成 UC、data 是点击坐标。
 # 多选时 data 怎么分隔有几种可能，所以都给出来依次试。
+#
+# 约定：builder 收 `(pts, tile_ids)`
+#   · pts      —— 点击坐标 [(x,y), ...]
+#   · tile_ids —— 对应格子的 1-based 编号（`select_region_list` 里的 id）
+# 之所以要 tile_ids：有种实现是「提交区域编号」而不是「提交坐标」，
+# 少了它就只能瞎填 1（无论选哪格都一样，格式等于失效）。
 ANS_FORMATS: tuple[tuple[str, Any], ...] = (
     # ① 最像滑块：一条记录，多点用分号串
-    ("uc_join_semicolon", lambda pts: json.dumps(
+    ("uc_join_semicolon", lambda pts, ids: json.dumps(
         [{"elem_id": 1, "type": "DynAnswerType_UC",
           "data": ";".join(f"{x},{y}" for x, y in pts)}], separators=(",", ":"))),
     # ② 每个点击一条记录，elem_id 递增
-    ("uc_multi_record", lambda pts: json.dumps(
+    ("uc_multi_record", lambda pts, ids: json.dumps(
         [{"elem_id": i + 1, "type": "DynAnswerType_UC", "data": f"{x},{y}"}
          for i, (x, y) in enumerate(pts)], separators=(",", ":"))),
-    # ③ 一条记录，坐标用逗号连着铺开
-    ("uc_join_comma", lambda pts: json.dumps(
+    # ③ 一条记录，坐标用逗号连着铺开（单点时与 ① 等价）
+    ("uc_join_comma", lambda pts, ids: json.dumps(
         [{"elem_id": 1, "type": "DynAnswerType_UC",
           "data": ",".join(f"{x},{y}" for x, y in pts)}], separators=(",", ":"))),
-    # ④ elem_id 直接填区域 id（有些实现用区域编号而不是坐标）
-    ("uc_region_ids", lambda pts: json.dumps(
+    # ④ 提交区域编号而不是坐标（用真实格子编号，不是瞎填 1）
+    ("uc_region_ids", lambda pts, ids: json.dumps(
         [{"elem_id": 1, "type": "DynAnswerType_UC",
-          "data": ",".join(str(i + 1) for i in range(len(pts)))}], separators=(",", ":"))),
+          "data": ",".join(str(i) for i in ids)}], separators=(",", ":"))),
 )
 
 
@@ -107,14 +113,96 @@ def _click_events(pts: Sequence[tuple[int, int]]):
     return events
 
 
+def _parse_challenge(pre: dict) -> dict:
+    """从一次 prehandle 的结果里抽出「题面 / 格子坐标 / 格子编号 / 图 URL / 会话」。
+
+    每换一次会话都要重新解析 —— 因为**每张新图的题目和正解位置都不同**，
+    旧会话上的识别结果对新会话毫无意义（这是很容易踩的坑）。
+    """
+    data = pre.get("data") or {}
+    dyn = data.get("dyn_show_info") or {}
+    ccfg = data.get("comm_captcha_cfg") or {}
+    sess = pre.get("sess")
+    instruction = str(dyn.get("instruction") or "").strip()
+
+    try:
+        payload = json.loads(dyn.get("json_payload") or "{}")
+    except (ValueError, TypeError):
+        payload = {}
+    raw_regions = [r for r in (payload.get("select_region_list") or []) if isinstance(r, dict)]
+    regions = [r.get("range") for r in raw_regions]
+    regions = [r for r in regions if isinstance(r, (list, tuple)) and len(r) >= 4]
+    # 格子的编号（提交区域编号那种格式要用，不能瞎填 1）
+    tile_ids = [
+        int(r["id"]) if str(r.get("id", "")).isdigit() else i + 1
+        for i, r in enumerate(raw_regions)
+    ]
+    if len(tile_ids) != len(regions):
+        tile_ids = list(range(1, len(regions) + 1))
+
+    bg = dyn.get("bg_elem_cfg") or {}
+    return {
+        "sess": sess,
+        "instruction": instruction,
+        "regions": regions,
+        "tile_ids": tile_ids,
+        "img_url": bg.get("img_url"),
+        "ccfg": ccfg,
+    }
+
+
+def _prepare_submission(solver, ch: dict, pick_index: int) -> dict:
+    """把「选中的那一格」变成可提交的四件套：ans 坐标、格子编号、collect+eks、pow。
+
+    保证**轨迹与答案自洽**：collect 只喂真正点的那一格（单选场景），
+    绝不把「看过的 6 格」当成「点过的 6 格」。
+    """
+    regions = ch["regions"]
+    tile_ids = ch["tile_ids"]
+    if not 0 <= pick_index < len(regions):
+        raise ClickSolveError(f"格子编号越界：{pick_index}（共 {len(regions)} 格）")
+
+    centers = _region_centers(regions)
+    pick_pt = centers[pick_index]
+    pick_id = tile_ids[pick_index] if pick_index < len(tile_ids) else pick_index + 1
+
+    tdc_path = str(ch["ccfg"].get("tdc_path", ""))
+    m = re.search(r"(?:\?|&)app_data=([^&]+)&t=(\d+)", tdc_path)
+    if not m:
+        raise ClickSolveError("tdc_path 里没有 app_data")
+    tdc_source = solver._tdc_download(m.group(1), m.group(2))
+
+    gen = solver._get_collect(tdc_source, _click_events([pick_pt]), None)
+    tokenid = gen.get("tokenid") or gen.get("token_id")
+    if tokenid:
+        solver._tdc_token = str(tokenid)
+        try:
+            solver.session.cookies.set("TDC_itoken", f"{tokenid}:1", domain=".qcloud.com", path="/")
+            solver.session.cookies.set("TDC_itoken", f"{tokenid}:1", domain=".gtimg.com", path="/")
+        except Exception:  # noqa: BLE001
+            pass
+
+    pow_cfg = ch["ccfg"].get("pow_cfg")
+    if not isinstance(pow_cfg, dict):
+        raise ClickSolveError("pow_cfg 缺失")
+    pow_answer, pow_ms = solver._pow(str(pow_cfg.get("prefix", "")), str(pow_cfg.get("md5", "")))
+
+    return {
+        "pts": [pick_pt],
+        "ids": [pick_id],
+        "collect": str(gen.get("collect", "")),
+        "eks": str(gen.get("eks", "")),
+        "pow_answer": pow_answer,
+        "pow_ms": pow_ms,
+    }
+
+
 def solve_click(
     solver,
     *,
     recognizer,
     top_k: int = 3,
-    max_picks: int = 3,
     probe_formats: bool | None = None,
-    debug: bool = False,
 ) -> dict[str, Any]:
     """跑一次点选题。
 
@@ -145,118 +233,85 @@ def solve_click(
     if not isinstance(sess, str) or not sess:
         raise ClickSolveError("prehandle 没给 sess")
 
-    instruction = str(dyn.get("instruction") or "").strip()
-    try:
-        payload = json.loads(dyn.get("json_payload") or "{}")
-    except (ValueError, TypeError):
-        payload = {}
-    raw_regions = payload.get("select_region_list") or []
-    regions = [r.get("range") for r in raw_regions if isinstance(r, dict)]
-    regions = [r for r in regions if isinstance(r, (list, tuple)) and len(r) >= 4]
-
-    if not instruction:
-        raise ClickSolveError("服务端没给题面（instruction 为空），无法识别")
-    if not regions:
-        raise ClickSolveError("服务端没给可选区域（select_region_list 为空）")
-
-    bg = dyn.get("bg_elem_cfg") or {}
-    img_url = bg.get("img_url")
-    if not isinstance(img_url, str) or not img_url:
-        raise ClickSolveError("背景图 URL 缺失")
-
-    LOG.info("点选：题面=%r 格子=%d", instruction, len(regions))
-
-    # ── ② 下载图 + 识别 ────────────────────────────────────────────────
-    from urllib.parse import urljoin
-
-    img_bytes = solver._download_bytes(urljoin(solver.endpoints.captcha_base_url, img_url))
-    try:
-        rec = recognizer.recognize(img_bytes, instruction, regions)
-    except Exception as err:  # noqa: BLE001
-        raise ClickNotSupported(f"点选识别失败：{type(err).__name__}: {err}") from err
-
-    picked_index = int(rec["pick_index"])
-    LOG.info("点选识别：选第 %d 格（候选 %s，margin=%.1f，%.2fs）",
-             picked_index + 1, rec.get("candidates"), rec.get("margin") or 0, rec.get("seconds", 0))
-
-    # ── ③ 生成 collect/eks（喂入点击事件，让轨迹像人点的）──────────────
-    tdc_path = str(ccfg.get("tdc_path", ""))
-    m = re.search(r"(?:\?|&)app_data=([^&]+)&t=(\d+)", tdc_path)
-    if not m:
-        raise ClickSolveError("tdc_path 里没有 app_data")
-    tdc_source = solver._tdc_download(m.group(1), m.group(2))
-
-    centers = _region_centers(regions)
-    if len(centers) != len(regions):
-        raise ClickSolveError("区域坐标不合法")
-    pick_pts = [centers[picked_index]]
-    gen = solver._get_collect(tdc_source, _click_events(centers), None)
-    collect = str(gen.get("collect", ""))
-    eks = str(gen.get("eks", ""))
-    tokenid = gen.get("tokenid") or gen.get("token_id")
-    if tokenid:
-        solver._tdc_token = str(tokenid)
-        try:
-            solver.session.cookies.set("TDC_itoken", f"{tokenid}:1", domain=".qcloud.com", path="/")
-            solver.session.cookies.set("TDC_itoken", f"{tokenid}:1", domain=".gtimg.com", path="/")
-        except Exception:  # noqa: BLE001
-            pass
-
-    # ── ④ pow ─────────────────────────────────────────────────────────
-    pow_cfg = ccfg.get("pow_cfg")
-    if not isinstance(pow_cfg, dict):
-        raise ClickSolveError("pow_cfg 缺失")
-    pow_answer, pow_ms = solver._pow(str(pow_cfg.get("prefix", "")), str(pow_cfg.get("md5", "")))
-
-    # ── ⑤ 提交 ────────────────────────────────────────────────────────
-    #
     # 默认只试第一种格式（`uc_join_semicolon`，与滑块 ans 结构最接近）：
-    # 每换一种格式都要**重新 prehandle 换会话**（贵，实测 +2.5s/次），
-    # 常规路径不该为不确定的猜测付这个代价。
+    # 每换一种格式都要**重新 prehandle 换会话**，而换了会话就是**另一道题**
+    # （实测 +2.5s/次，还得重新识别），常规路径不该为不确定的猜测付这个代价。
     # 要探明哪种格式对时设 QQ_SLIDER_CLICK_PROBE=1。
     formats = ANS_FORMATS if probe_formats else ANS_FORMATS[:1]
 
     result: dict[str, Any] = {}
     used_format = ""
-    for idx, (name, build) in enumerate(formats):
-        if idx > 0:
-            # 换会话重来：上一次的 sess 已经被消费
-            try:
-                pre2 = solver.prehandle()
-                d2 = pre2.get("data") or {}
-                dyn2 = d2.get("dyn_show_info") or {}
-                sess = pre2.get("sess") or sess
-                c2 = d2.get("comm_captcha_cfg") or {}
-                pj2 = json.loads(dyn2.get("json_payload") or "{}")
-                r2 = [r.get("range") for r in (pj2.get("select_region_list") or []) if isinstance(r, dict)]
-                r2 = [r for r in r2 if isinstance(r, (list, tuple)) and len(r) >= 4]
-                if r2:
-                    regions = r2
-                    centers = _region_centers(regions)
-                    pick_pts = [centers[min(picked_index, len(centers) - 1)]]
-                m2 = re.search(r"(?:\?|&)app_data=([^&]+)&t=(\d+)", str(c2.get("tdc_path", "")))
-                if m2:
-                    tdc_source = solver._tdc_download(m2.group(1), m2.group(2))
-                gen = solver._get_collect(tdc_source, _click_events(centers), None)
-                collect = str(gen.get("collect", ""))
-                eks = str(gen.get("eks", ""))
-                pw2 = c2.get("pow_cfg") or {}
-                if pw2:
-                    pow_answer, pow_ms = solver._pow(str(pw2.get("prefix", "")), str(pw2.get("md5", "")))
-            except Exception as err:  # noqa: BLE001
-                LOG.debug("换会话重试失败（沿用旧会话）：%s", err)
+    instruction = ""
+    last_pick = 0
+    last_cands = None
+    last_margin = None
 
-        ans_json = build(pick_pts)
+    for idx, (name, build) in enumerate(formats):
+        # 每一轮都从**当前这一张图**重新取题、重新识别 ——
+        # 绝不复用上一轮的识别结果：换了会话就是换了题，旧索引是废的。
+        if idx == 0:
+            pre = solver.prehandle()
+        else:
+            pre = solver.prehandle()
+            LOG.debug("换会话重试格式 %s（新题，需重新识别）", name)
+
+        if pre.get("state") != 1:
+            LOG.warning("格式 %s：prehandle state=%r", name, pre.get("state"))
+            continue
+        ch = _parse_challenge(pre)
+        if not isinstance(ch["sess"], str) or not ch["sess"]:
+            LOG.warning("格式 %s：prehandle 没给 sess", name)
+            continue
+        if not ch["instruction"] or not ch["regions"]:
+            LOG.warning("格式 %s：题面或格子缺失", name)
+            continue
+        if not isinstance(ch["img_url"], str) or not ch["img_url"]:
+            LOG.warning("格式 %s：背景图 URL 缺失", name)
+            continue
+
+        if idx == 0:
+            LOG.info("点选：题面=%r 格子=%d", ch["instruction"], len(ch["regions"]))
+
+        # 识别（每轮都做）
+        from urllib.parse import urljoin
+
+        img_bytes = solver._download_bytes(urljoin(solver.endpoints.captcha_base_url, ch["img_url"]))
+        try:
+            rec = recognizer.recognize(img_bytes, ch["instruction"], ch["regions"])
+        except Exception as err:  # noqa: BLE001
+            if idx == 0:
+                raise ClickNotSupported(f"点选识别失败：{type(err).__name__}: {err}") from err
+            LOG.warning("格式 %s：识别失败 %s", name, err)
+            continue
+
+        picked_index = int(rec["pick_index"])
+        if idx == 0:
+            LOG.info("点选识别：选第 %d 格（候选 %s，margin=%.1f，%.2fs）",
+                     picked_index + 1, rec.get("candidates"),
+                     rec.get("margin") or 0, rec.get("seconds", 0))
+        instruction = ch["instruction"]
+        last_pick = picked_index + 1
+        last_cands = rec.get("candidates")
+        last_margin = rec.get("margin")
+
+        try:
+            sub = _prepare_submission(solver, ch, picked_index)
+        except ClickSolveError as err:
+            LOG.warning("格式 %s：准备提交失败 %s", name, err)
+            continue
+
+        ans_json = build(sub["pts"], sub["ids"])
         LOG.debug("点选提交格式=%s ans=%s", name, ans_json)
         try:
-            result = _submit(solver, sess, collect, eks, ans_json, pow_answer, pow_ms)
+            result = _submit(solver, ch["sess"], sub["collect"], sub["eks"],
+                             ans_json, sub["pow_answer"], sub["pow_ms"])
         except Exception as err:  # noqa: BLE001
             LOG.warning("点选提交（%s）异常 %s: %s", name, type(err).__name__, err)
             continue
 
         ec = str(result.get("errorCode", ""))
         used_format = name
-        # 0 = 成功；其它码里 50/51 是「答案错/被拒」，说明格式被接受了
+        # 0 = 成功；50/51 是「答案错/被拒」，说明**格式被接受了**，别再换
         if ec == "0" and result.get("ticket"):
             LOG.info("点选成功（格式 %s）", name)
             break
@@ -277,9 +332,9 @@ def solve_click(
         "seconds": seconds,
         "kind": "click",
         "instruction": instruction,
-        "pick": picked_index + 1,
-        "candidates": rec.get("candidates"),
-        "margin": rec.get("margin"),
+        "pick": last_pick,
+        "candidates": last_cands,
+        "margin": last_margin,
         "ans_format": used_format,
         "solver": "local-clip",
     }

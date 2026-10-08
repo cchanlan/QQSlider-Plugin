@@ -227,12 +227,80 @@ def _solve_click_variant(solver, kind: str) -> dict:
     try:
         return click_solver.solve_click(solver, recognizer=rec, top_k=top_k)
     except click_solver.ClickNotSupported as err:
-        # 模型没装好 → 退回纯 CV（准确率低但不至于整个失败）
-        LOG.warning("CLIP 不可用，回落纯 CV：%s", err)
-        return {"errorCode": "-1", "errMessage": str(err), "solver": "cv_fallback"}
+        # 模型没装好 → 真正回落到纯 CV（准确率约 48%，但总比直接失败好）
+        return _solve_click_cv_fallback(solver, rec, err)
     except Exception as err:  # noqa: BLE001
         LOG.exception("点选解题异常")
         return {"errorCode": "-1", "errMessage": f"{type(err).__name__}: {err}"}
+
+
+def _solve_click_cv_fallback(solver, recognizer, cause) -> dict:
+    """纯 CV 兜底：模型没装好时至少把「最像异类」的那格点掉。
+
+    ⚠️ 这条路的准确率只有约 48%（实测 25 张人工核对样本 12/25），
+    所以**必须**在返回里标出 `solver=cv_only`、并让插件侧提示用户装模型 ——
+    不能让人以为这是正常水准。
+    """
+    import json as _json
+
+    LOG.warning("CLIP 不可用，回落纯 CV（准确率低）：%s", cause)
+    try:
+        import re as _re
+        from urllib.parse import urljoin
+
+        pre = solver.prehandle()
+        data = pre.get("data") or {}
+        dyn = data.get("dyn_show_info") or {}
+        ccfg = data.get("comm_captcha_cfg") or {}
+        sess = pre.get("sess")
+        instruction = str(dyn.get("instruction") or "").strip()
+        payload = _json.loads(dyn.get("json_payload") or "{}")
+        regions = [r.get("range") for r in (payload.get("select_region_list") or [])
+                   if isinstance(r, dict)]
+        regions = [r for r in regions if isinstance(r, (list, tuple)) and len(r) >= 4]
+        bg = dyn.get("bg_elem_cfg") or {}
+        if not (sess and regions and bg.get("img_url")):
+            return {"errorCode": "-1", "errMessage": f"{cause}（且纯 CV 兜底拿不到题目）"}
+
+        raw = solver._download_bytes(urljoin(solver.endpoints.captcha_base_url, bg["img_url"]))
+        rec = recognizer.recognize_cv_only(raw, regions)
+        centers = [((int(r[0]) + int(r[2])) // 2, (int(r[1]) + int(r[3])) // 2) for r in regions]
+        pick_idx = int(rec["pick_index"])
+        pick_pt = centers[pick_idx]
+        # 格子编号：格式④要提交它，不能瞎填 1
+        raw_regs = [r for r in (payload.get("select_region_list") or []) if isinstance(r, dict)]
+        tile_ids = [
+            int(r["id"]) if str(r.get("id", "")).isdigit() else i + 1
+            for i, r in enumerate(raw_regs)
+        ]
+        pick_id = tile_ids[pick_idx] if pick_idx < len(tile_ids) else pick_idx + 1
+
+        m = _re.search(r"(?:\?|&)app_data=([^&]+)&t=(\d+)", str(ccfg.get("tdc_path", "")))
+        if not m:
+            return {"errorCode": "-1", "errMessage": f"{cause}（且 tdc_path 无 app_data）"}
+        import click_solver
+
+        tdc_source = solver._tdc_download(m.group(1), m.group(2))
+        gen = solver._get_collect(tdc_source, click_solver._click_events([pick_pt]), None)
+        collect = str(gen.get("collect", ""))
+        eks = str(gen.get("eks", ""))
+        pw = ccfg.get("pow_cfg") or {}
+        pa, pt = solver._pow(str(pw.get("prefix", "")), str(pw.get("md5", "")))
+
+        build = click_solver.ANS_FORMATS[0][1]
+        ans = build([pick_pt], [pick_id])
+        result = click_solver._submit(solver, sess, collect, eks, ans, pa, pt)
+        result = dict(result)
+        result["solver"] = "cv_only"
+        result["instruction"] = instruction
+        result["pick"] = pick_idx + 1
+        result["candidates"] = rec.get("candidates")
+        return result
+    except Exception as err:  # noqa: BLE001
+        LOG.exception("纯 CV 兜底也失败")
+        return {"errorCode": "-1",
+                "errMessage": f"点选失败（CLIP 不可用：{cause}；纯 CV 兜底也失败：{err}）",
+                "solver": "cv_fallback"}
 
 
 def parse_slider_url(url: str) -> dict:
