@@ -210,6 +210,18 @@ set QQSLIDER_PIP_INDEX=https://pypi.org/simple
 
 ## 常见问题
 
+**Q：提示「安装依赖失败：…No module named pip」？**
+这是虚拟环境里缺 pip（Debian / Ubuntu 少装 `python3-venv` 时常见）。
+插件会自己修（依次试 ensurepip、`venv --upgrade-deps`、系统 pip、get-pip.py，
+最后重建环境），修不好才提示你。
+照提示做一次即可：
+
+```bash
+apt install python3-venv python3-pip
+```
+
+然后发 `#滑块过码安装`。
+
 **Q：遇到点选但没过？**
 点选靠本地模型识别。先发 `#滑块过码状态` 看「点选」那行：
 

@@ -11,6 +11,9 @@ service/.venv/.deps-ok
 service/.models/
 *.part
 
+# pip 引导脚本（venv 缺 pip 时临时下载，用完即删；进程被中断可能残留）
+service/.get-pip.py
+
 # 编辑器 / 系统
 .vscode/
 .idea/

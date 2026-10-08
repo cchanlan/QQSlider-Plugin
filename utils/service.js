@@ -106,9 +106,48 @@ export function findNode() {
   return _nodeCache
 }
 
-/** 检查依赖是否已装好（靠标记文件 + 解释器存在双重判断） */
+/**
+ * venv 的 site-packages 目录（可能有多套，全给出来）。
+ * 纯文件系统操作，给 `depsReady` 用，必须秒回。
+ */
+function venvSitePackages() {
+  const dirs = []
+  if (isWin) {
+    dirs.push(path.join(VENV_DIR, "Lib", "site-packages"))
+    return dirs
+  }
+  try {
+    for (const name of fs.readdirSync(path.join(VENV_DIR, "lib"))) {
+      if (/^python\d/.test(name)) dirs.push(path.join(VENV_DIR, "lib", name, "site-packages"))
+    }
+  } catch {
+    /* venv 还没建 */
+  }
+  return dirs
+}
+
+/**
+ * venv 里到底有没有 pip —— **只看文件，不启进程**。
+ *
+ * 为什么不能只看「解释器在不在」：Debian / Ubuntu 上没装 `python3-venv` 时，
+ * `python3 -m venv` 会**以退出码 0 建出一个没有 pip 的 venv**（ensurepip 被剥离，
+ * 只在 stderr 留一句警告）。只看解释器就会把它当成「装好了」，
+ * 之后每次 `-m pip install` 都报 `No module named pip`。
+ */
+function venvHasPip() {
+  for (const dir of venvSitePackages()) {
+    try {
+      if (fs.existsSync(path.join(dir, "pip", "__init__.py"))) return true
+    } catch {
+      /* 下一个 */
+    }
+  }
+  return false
+}
+
+/** 检查依赖是否已装好（解释器 + pip + 就绪标记，三重判断） */
 export function depsReady() {
-  return fs.existsSync(venvPython()) && fs.existsSync(READY_FLAG)
+  return fs.existsSync(venvPython()) && fs.existsSync(READY_FLAG) && venvHasPip()
 }
 
 /** pip 的 HTTP 缓存目录（按平台推，不写死绝对路径） */
@@ -221,6 +260,53 @@ function tail(text, n = 400) {
 }
 
 /**
+ * 把所有镜像源的失败原因归并成一句**能照做**的话。
+ *
+ * 为什么要归并：用户实测的报错长这样 ——
+ *
+ *     安装依赖失败：https://pypi.org/simple/:/root/jiuli/plugins/QQSlider-Plugin/
+ *     service/.venv/bin/python: No module named pip
+ *
+ * 它把**源地址、解释器路径、真实原因**用冒号拼成一串，看着像「这个源不通」，
+ * 于是用户会去换源 —— 而真因是 venv 里没有 pip，换一百个源都一样。
+ *
+ * 所以这里：
+ *   · 按**去掉源地址后**的原因去重（同一个真因只报一次）
+ *   · 认出几种常见真因，直接翻译成「该做什么」
+ *
+ * （导出是为了能单测这个纯函数，插件内部不当公开 API 用。）
+ */
+export function summarizeFailures(failures, fallback = "") {
+  const list = failures.filter(Boolean)
+  if (!list.length) return fallback || "所有镜像源都不可用"
+
+  // 去掉每条的 `源：` 前缀，看是不是同一个原因
+  const reasons = list.map(s => String(s).replace(/^https?:\/\/\S+?[：:]\s*/, "").trim())
+  const uniq = [...new Set(reasons)]
+
+  const joined = uniq.join(" ").toLowerCase()
+  if (/no module named pip/.test(joined)) {
+    return "虚拟环境里没有 pip（执行 apt install python3-venv python3-pip 后重试）"
+  }
+  if (/no module named (venv|ensurepip)/.test(joined)) {
+    return "缺少 venv 组件（Debian/Ubuntu 上执行 apt install python3-venv 后重试）"
+  }
+  if (/could not find a version|no matching distribution/.test(joined)) {
+    return `找不到可安装的版本，可能是网络或 Python 版本不匹配：${tail(uniq[0], 200)}`
+  }
+  if (/permission denied|errno 13/.test(joined)) {
+    return `权限不足（插件目录不可写？）：${tail(uniq[0], 200)}`
+  }
+  if (/ssl|certificate|tls/.test(joined)) {
+    return `HTTPS 证书校验失败（检查系统时间 / 代理）：${tail(uniq[0], 200)}`
+  }
+
+  // 原因各不相同时，报第一个 + 说明还有几个源也失败（别只报最后一个）
+  const first = tail(uniq[0], 220)
+  return uniq.length > 1 ? `${first}（另外 ${uniq.length - 1} 个源同样失败）` : first
+}
+
+/**
  * 探测 pip 缓存目录**站在这个 venv 的 Python 视角**能不能用。
  *
  * 为什么必须用 Python 探、不能用 Node 探：
@@ -268,6 +354,167 @@ async function cacheUsable(pythonBin, logger) {
       : `pip 缓存目录不可写（${dir}），本次跳过快取缓存`,
   )
   return false
+}
+
+/**
+ * 启进程真跑一次 `-m pip --version`。
+ *
+ * 比 `venvHasPip()` 看文件更准（pip 目录在、但坏了/版本不兼容也能查出来），
+ * 所以只在安装流程里用 —— 它有进程开销，不能进 `depsReady()`。
+ */
+async function pipWorks(pythonBin, logger) {
+  if (!pythonBin || !fs.existsSync(pythonBin)) return false
+  const r = await run(pythonBin, ["-m", "pip", "--version"], {
+    env: pipEnv(),
+    timeout: 30000,
+    silenceTimeout: 15000,
+  })
+  if (r.code === 0 && /\bpip\s+\d/.test(r.out)) return true
+  logger?.debug?.(`${path.basename(pythonBin)} -m pip 不可用：${tail(r.out, 200)}`)
+  return false
+}
+
+/**
+ * 下载官方 get-pip.py 到插件目录。
+ *
+ * 落盘在 `service/` 而不是系统临时目录：Windows 的 `%TEMP%` 在沙箱化进程里
+ * 可能不可写，而插件目录是确定的、且安装完会删掉。
+ *
+ * @returns {Promise<string|null>} 落盘路径
+ */
+async function downloadGetPip(logger) {
+  const target = path.join(SERVICE_DIR, ".get-pip.py")
+  const urls = [
+    "https://bootstrap.pypa.io/get-pip.py",
+    "https://mirrors.aliyun.com/pypi/get-pip.py",
+    "https://pypi.tuna.tsinghua.edu.cn/get-pip.py",
+  ]
+  for (const url of urls) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 60000)
+    try {
+      const res = await fetch(url, { signal: controller.signal })
+      if (!res.ok) continue
+      const text = await res.text()
+      // 认一下内容：别把错误页 / 半截响应当脚本执行
+      if (text.length < 10000 || !/import\s+sys/.test(text)) continue
+      await fsp.writeFile(target, text, "utf8")
+      return target
+    } catch (err) {
+      logger?.debug?.(`get-pip.py 下载失败（${url}）：${err?.message || err}`)
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+  return null
+}
+
+/**
+ * venv 里没有 pip 时就地补上。
+ *
+ * ## 为什么要专门做这一步
+ *
+ * 用户实测（2026-10-08，HLbot / JiuLi，Debian）：日志里是
+ * `安装依赖失败：https://pypi.org/simple/:/root/jiuli/plugins/QQSlider-Plugin/service/.venv/bin/python:
+ * No module named pip` —— 注意它把**镜像源和解释器拼在了一条消息**里，
+ * 看着像「源的问题」，实际每个源都死在同一个地方：**venv 里根本没有 pip**。
+ *
+ * 根因是 Debian/Ubuntu 没装 `python3-venv` 时，`python3 -m venv` **退出码 0**
+ * 但建出的 venv 不含 pip（ensurepip 被剥离）。原来的代码只看退出码，
+ * 于是「建 venv 成功 → 装依赖失败 → 用户重试 → 再次失败」死循环。
+ *
+ * ## 自愈顺序（代价从低到高，任一步成功即返回）
+ *
+ *   ① `-m ensurepip`            Python 自带，多数情况一步到位
+ *   ② `venv --upgrade-deps`     让 venv 模块自己重装 pip
+ *   ③ 系统 pip `--python <venv>` pip 22.3+ 支持往别的解释器里装
+ *   ④ `get-pip.py`              前三步都不行时取官方引导脚本
+ *   ⑤ 重建 venv（带系统包）      最后兜底：能看见系统的 pip 就能用
+ *
+ * @returns {Promise<{ok:boolean, how?:string, error?:string}>}
+ */
+async function repairPip(python, logger) {
+  const log = m => logger?.info?.(m)
+  const dbg = m => logger?.debug?.(m)
+  const py = venvPython()
+
+  // ① ensurepip
+  log("虚拟环境里没有 pip，用 ensurepip 补上…")
+  let r = await run(py, ["-m", "ensurepip", "--upgrade", "--default-pip"], {
+    env: pipEnv(),
+    timeout: 180000,
+    silenceTimeout: 90000,
+    onLine: dbg,
+  })
+  if (await pipWorks(py, logger)) return { ok: true, how: "ensurepip" }
+  dbg(`ensurepip 没成功：${tail(r.out, 200)}`)
+
+  // ② venv --upgrade-deps（venv 模块会顺带把 pip 装上）
+  log("改用 venv --upgrade-deps 补 pip…")
+  r = await run(python, ["-m", "venv", "--upgrade-deps", VENV_DIR], {
+    env: pipEnv(),
+    timeout: 300000,
+    silenceTimeout: 120000,
+    onLine: dbg,
+  })
+  if (await pipWorks(py, logger)) return { ok: true, how: "venv --upgrade-deps" }
+  dbg(`venv --upgrade-deps 没成功：${tail(r.out, 200)}`)
+
+  // ③ 借系统 pip 往 venv 里装（pip 22.3+ 才有 --python）
+  if (await pipWorks(python, logger)) {
+    log("用系统 pip 往虚拟环境里装 pip…")
+    r = await run(python, ["-m", "pip", "install", "--upgrade", "--python", py, "pip"], {
+      env: pipEnv(),
+      timeout: 300000,
+      silenceTimeout: 120000,
+      onLine: dbg,
+    })
+    if (await pipWorks(py, logger)) return { ok: true, how: "系统 pip --python" }
+    dbg(`系统 pip --python 没成功：${tail(r.out, 200)}`)
+  }
+
+  // ④ get-pip.py
+  const bootstrap = await downloadGetPip(logger)
+  if (bootstrap) {
+    log("用官方 get-pip.py 补 pip…")
+    r = await run(py, [bootstrap, "--no-warn-script-location"], {
+      env: pipEnv(),
+      timeout: 600000,
+      silenceTimeout: 150000,
+      onLine: dbg,
+    })
+    try {
+      fs.rmSync(bootstrap, { force: true })
+    } catch {
+      /* 删不掉也无妨，下次会覆盖 */
+    }
+    if (await pipWorks(py, logger)) return { ok: true, how: "get-pip.py" }
+    dbg(`get-pip.py 没成功：${tail(r.out, 200)}`)
+  }
+
+  // ⑤ 重建 venv，让它能看见系统已装的包（系统有 pip 时 venv 就能用）
+  log("重建虚拟环境（带系统包）…")
+  try {
+    fs.rmSync(VENV_DIR, { recursive: true, force: true })
+  } catch {
+    /* 删不掉就让 venv 自己报错 */
+  }
+  r = await run(python, ["-m", "venv", "--system-site-packages", VENV_DIR], {
+    env: pipEnv(),
+    timeout: 300000,
+    silenceTimeout: 120000,
+    onLine: dbg,
+  })
+  if (await pipWorks(venvPython(), logger)) return { ok: true, how: "venv --system-site-packages" }
+
+  return {
+    ok: false,
+    error:
+      "虚拟环境里装不上 pip。" +
+      (isWin
+        ? "重装 Python（安装时勾选 pip）后发 #滑块过码安装"
+        : "执行 apt install python3-venv python3-pip（或对应发行版的包名）后发 #滑块过码安装"),
+  }
 }
 
 /**
@@ -323,6 +570,18 @@ export async function installDeps({ logger, force = false } = {}) {
     }
   }
 
+  // ── 1b. venv 里必须有 pip ────────────────────────────────────────────
+  //
+  // ⚠️ 这一步不能省：Debian/Ubuntu 缺 python3-venv 时，`python3 -m venv`
+  // **退出码 0 但建出的 venv 不含 pip**，随后每个镜像源都报同一句
+  // `No module named pip`（用户实测踩过，见 repairPip 的注释）。
+  // 老用户升级上来时 venv 已存在、同样可能没有 pip，所以这里无条件检查。
+  if (!(await pipWorks(venvPython(), logger))) {
+    const fixed = await repairPip(python, logger)
+    if (!fixed.ok) return { ok: false, error: `${fixed.error}。${FIX_HINT}` }
+    log(`虚拟环境 pip 已就绪（${fixed.how}）`)
+  }
+
   // ── 2. 用 venv 自己的 Python 探缓存可用性 ────────────────────────────
   const extraArgs = []
   if (!(await cacheUsable(venvPython(), logger))) extraArgs.push("--no-cache-dir")
@@ -330,6 +589,9 @@ export async function installDeps({ logger, force = false } = {}) {
   // ── 3. 装依赖：多镜像依次重试 ─────────────────────────────────────────
   let lastError = ""
   let installed = false
+  // 所有源都失败时，原因往往是**同一个**（venv 坏了、缺编译工具、没网）。
+  // 只报最后一个源会让人以为是「那个源的问题」，所以把每个源的原因都记下来。
+  const failures = []
 
   for (const index of pipIndexes()) {
     log(`安装依赖（源：${index}）…`)
@@ -357,17 +619,43 @@ export async function installDeps({ logger, force = false } = {}) {
     }
     if (r.killed === "silence") {
       lastError = `源 ${index} 无响应（已等 90 秒无输出）`
+      failures.push(lastError)
       log(`${lastError}，换下一个源`)
       // 卡住的源多半也写不了缓存，后续都别用缓存了
       if (!extraArgs.includes("--no-cache-dir")) extraArgs.push("--no-cache-dir")
       continue
     }
+    // venv 里的 pip 中途坏掉时，所有源都会报同一句 `No module named pip`。
+    // 这种情况换源毫无意义，直接再修一次 pip 然后原地重试。
+    if (/No module named pip/i.test(r.out)) {
+      log("虚拟环境的 pip 不可用，重新修复后再试…")
+      const fixed = await repairPip(python, logger)
+      if (fixed.ok) {
+        log(`pip 已修复（${fixed.how}），重试当前源`)
+        const retry = await run(
+          venvPython(),
+          ["-m", "pip", "install", "--disable-pip-version-check", "-i", index,
+           "-r", REQUIREMENTS, ...extraArgs],
+          { logger, env: pipEnv(), timeout: 900000, silenceTimeout: 90000, onLine: dbg },
+        )
+        if (retry.code === 0) {
+          installed = true
+          break
+        }
+        lastError = `${index}：${tail(retry.out)}`
+        failures.push(lastError)
+      } else {
+        return { ok: false, error: `${fixed.error}。${FIX_HINT}` }
+      }
+      continue
+    }
     lastError = `${index}：${r.error?.message || tail(r.out)}`
+    failures.push(lastError)
     log("该源安装失败，换下一个源")
   }
 
   if (!installed) {
-    return { ok: false, error: `安装依赖失败：${lastError || "所有镜像源都不可用"}。${FIX_HINT}` }
+    return { ok: false, error: `安装依赖失败：${summarizeFailures(failures, lastError)}。${FIX_HINT}` }
   }
 
   // ── 4. 真验一遍能不能 import，别只看 pip 退出码 ────────────────────────

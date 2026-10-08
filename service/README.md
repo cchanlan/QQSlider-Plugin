@@ -94,7 +94,7 @@ python -m venv .venv
 | ④ 轨迹 | 每格生成 mousedown→mouseup→click 事件 |
 | ⑤ 参数 | 把点击事件喂给 `tdc.js`（它原生支持 `clicks` 参数）|
 | ⑥ pow | 解工作量证明 |
-| ⑦ verify | 提交 `ans`（`DynAnswerType_UC`），拿 ticket |
+| ⑦ verify | 提交 `ans`（`DynAnswerType_UC`，**内容是区域编号**），拿 ticket |
 
 **为什么必须用模型**：协议里只有题面，**没有任何答案字段**（实测 60 张真题）：
 
@@ -109,35 +109,77 @@ python -m venv .venv
 **没有逆向 jsvmp，也没有浏览器** —— `collect`/`eks` 是腾讯自己的 `tdc.js`
 在 Node 的 `vm` 里算出来的，腾讯改算法也不用跟着改。
 
-## ⚠️ 点选提交格式尚未在真实登录中验证（改代码前必读）
+## ✅ 点选提交格式（已从腾讯源码确认 + 实测对照）
 
-**识别链路已完整验证**（60 张真题 + 12/12 复测），但**提交格式还没被真实验证过**，原因：
+**`ans` 的正确形态是「一条记录、`elem_id` 恒为 1、`data` 是区域编号的逗号串」**：
 
-静态探测（不带真实 `cap_cd`）拿到的会话本身就是无效的。
-用它试了 **6 种截然不同的 `ans` 格式**，**全部返回 `errorCode=9`** ——
-说明服务端在「解析 ans」之前就拒了。所以那个 ec=9 反映的是**会话无效**，
-不是格式对错，**无法用它区分格式**。
+```json
+[{"elem_id":1,"type":"DynAnswerType_UC","data":"3"}]
+```
 
-因此 `click_solver.py` 的做法是：
+单选就是一个编号（`"3"`），多选是逗号串（`"2,5"`）。**不是坐标**。
 
-- **默认只试一种**格式（`uc_join_semicolon`，与滑块的 `DynAnswerType_POS` 结构最像）：
-  换格式要重建会话，实测每次 +2.5 秒，常规路径不该为猜测付这个代价
-- 设 **`QQ_SLIDER_CLICK_PROBE=1`** 会依次试全部 4 种格式，并把实际命中的
-  记进日志 —— **等有真实登录 URL（真 `cap_cd`）时，用它一次就能定下来**
+### 依据一：腾讯前端源码（决定性）
 
-判据：如果某个格式**格式对但答案错**，服务端会返 `ec=50` 或 `51`
-（而不是 9）。所以看到 50/51 就说明格式被接受了 —— 代码里也是这么判的，
-遇到 50/51 会立即停止换格式。
+QQ 登录的点选由 `t.captcha.qq.com/template/drag_ele.html` 加载
+**`https://captcha.gtimg.com/1/dy-ele.d10b59c0.js`**（QQ 域名这份，
+跟 turing 域名的 `dy-ele.bf9c9389.js` 不是同一个文件）。
+其中 `SelectEl.prototype.addData` 原文：
 
-**已知 errorCode 语义**（实测 + 上游代码）：
+```js
+if ("DynAnswerType_UC" === l) {
+  m.push(h.id)                      // h.id = select_region_list 里的区域编号
+  emit("setData", { namespace: "selectEl",
+    data: [{ elem_id: 1, type: "DynAnswerType_UC", data: m.join(",") }] })
+}
+```
 
-| 码 | 含义 |
-|---|---|
-| `0` | 成功 |
-| `9` | 会话无效（`cap_cd`/`sess` 不成立）|
-| `12` | 热度控制（同 IP 高频连续过码，会自己恢复）|
-| `50` | 答案错（降热机制触发时"故意全错"）|
-| `51` | 答案错/被拒（点选实测见到）|
+对照：同文件里 `DynAnswerType_POS` / `_POS_L`（`ClickEl`，即 dy-ele 那套老点选）
+才提交坐标，而**服务端给点选下发的是 `data_type: ["DynAnswerType_UC"]`**
+（实测 `t.captcha.qq.com` 的 prehandle 确认），走的正是上面这支。
+
+⚠️ **踩过的坑**：turing 域名那两份 dy-ele（`dy-ele.js` / `dy-ele.bf9c9389.js`）
+里**根本没有 `DynAnswerType_UC`** —— 只看它们会以为「UC 不存在」，
+进而去猜坐标格式。**必须看 QQ 域名那份**。
+
+### 依据二：实测对照（4 种格式 × 真实 prehandle 会话）
+
+| 格式 | `ans` 的 data | errorCode |
+|---|---|---|
+| **`uc_region_ids`（正确）** | `"3"`（区域编号） | **`51` verifyHybrid** |
+| `uc_join_semicolon` | `"336,144"`（坐标分号） | `9` |
+| `uc_multi_record` | 一条一点、elem_id 递增 | `9` |
+| `uc_join_comma` | `"336,144"`（坐标逗号） | `9` |
+
+**`uc_region_ids` 的返回码与另外三种不同**（51 vs 9），说明服务端真的解析了 `ans`
+并接受了这个格式 —— 51 是 `verifyHybrid`，属于「格式对、答案不对」那一类。
+
+> 这条实测同时**推翻了旧结论**：以前试的 4 种格式全返 `ec=9`，
+> 于是记录里写成「假 cap_cd 的会话在解析 ans 之前就被拒，无法区分格式」。
+> 真相是**那 4 种全都不对**，正确的格式从没被试过。
+
+### errorCode 语义（扒自 `dy-ele` 的 verify 分发表）
+
+| 码 | 名字 | 含义 |
+|---|---|---|
+| `0` | `verifySuccess` | 成功 |
+| `9` | `verifyFailRefresh` | **验证失败、换一张题重来**（不是「会话无效」）|
+| `12` | `verifyError` | 风控 / 环境异常（同 IP 高频连续过码，会自己恢复）|
+| `20` | `verifySessionTimeout` | 会话超时 |
+| `50` | `verifyFail` | 答案不对 |
+| `51` | `verifyHybrid` | 混合验证（答案不对那类）|
+| `52` | `verifyError` | 错误 |
+| `206` | `verifySessionTimeout` | 会话超时 |
+
+⚠️ `9` 的语义尤其容易误判 —— 它是「换题重来」，所以代码里遇到 ec=9 会
+**换会话重试**（`QQ_SLIDER_CLICK_REFRESH`，默认 3 次），每换一次都是新题、必须重新识别。
+
+### 调试开关
+
+- **`QQ_SLIDER_CLICK_PROBE=1`** —— 依次试全部 4 种格式并把结果记进日志。
+  只在「怀疑腾讯改版了」时用；常规路径**默认只用 `uc_region_ids`**。
+- **`QQ_SLIDER_CLICK_REFRESH=<n>`** —— ec=9 时的换题重试次数，默认 3。
+
 
 ## 三个实现要点（改代码前先看）
 

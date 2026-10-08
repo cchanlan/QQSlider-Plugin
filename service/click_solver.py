@@ -52,35 +52,76 @@ class ClickNotSupported(ClickSolveError):
     """点选识别能力不可用（模型没装好）。"""
 
 
-# ── ans 候选格式（按可能性排序）────────────────────────────────────────
+# ── ans 候选格式 ───────────────────────────────────────────────────────
 #
-# 依据：滑块用的是 [{"elem_id":1,"type":"DynAnswerType_POS","data":"x,y"}]，
-# 点选是同一个 ans 容器，只是 type 换成 UC、data 是点击坐标。
-# 多选时 data 怎么分隔有几种可能，所以都给出来依次试。
+# ★ 第 ① 种是**腾讯前端源码确认的正确格式**，默认只用它。
+#
+# 依据（2026-10-08 实扒腾讯脚本，不再是猜的）：
+#   QQ 登录点选真正加载的是 `https://captcha.gtimg.com/1/dy-ele.d10b59c0.js`
+#   （由 `t.captcha.qq.com/template/drag_ele.html` 引入；turing 域名那两份
+#   dy-ele 里**根本没有 DynAnswerType_UC**，所以之前照它们猜的格式必然错）。
+#
+#   SelectEl.prototype.addData 原文：
+#
+#       if ("DynAnswerType_UC" === l) {
+#         m.push(h.id)                      // h.id = select_region_list 里的区域编号
+#         emit("setData", { namespace: "selectEl",
+#           data: [{ elem_id: 1, type: "DynAnswerType_UC", data: m.join(",") }] })
+#       }
+#
+#   → **一条记录、`elem_id` 恒为 1、`data` 是「区域编号的逗号串」**，
+#     既不是坐标，也不是「一点一条、elem_id 递增」。
+#     单选时 data 就是一个编号（如 `"3"`）。
+#
+#   对照：同文件里 `DynAnswerType_POS` / `_POS_L`（clickEl）才提交坐标，
+#   而服务端给点选下发的是 `data_type: ["DynAnswerType_UC"]`，走的正是上面这支。
+#
+#   另一条旁证：`DynAnswerType_UC` 只存在于 QQ 那份 dy-ele，且它同文件里
+#   还带 `DynAnswerType_ID`（提交 mask 的 id 数组）—— 两者共用 `this.masks`，
+#   再次说明 UC 的 data 就是区域编号。
 #
 # 约定：builder 收 `(pts, tile_ids)`
-#   · pts      —— 点击坐标 [(x,y), ...]
+#   · pts      —— 点击坐标 [(x,y), ...]（喂给 TDC 造轨迹用，不进 ans）
 #   · tile_ids —— 对应格子的 1-based 编号（`select_region_list` 里的 id）
-# 之所以要 tile_ids：有种实现是「提交区域编号」而不是「提交坐标」，
-# 少了它就只能瞎填 1（无论选哪格都一样，格式等于失效）。
 ANS_FORMATS: tuple[tuple[str, Any], ...] = (
-    # ① 最像滑块：一条记录，多点用分号串
-    ("uc_join_semicolon", lambda pts, ids: json.dumps(
-        [{"elem_id": 1, "type": "DynAnswerType_UC",
-          "data": ";".join(f"{x},{y}" for x, y in pts)}], separators=(",", ":"))),
-    # ② 每个点击一条记录，elem_id 递增
-    ("uc_multi_record", lambda pts, ids: json.dumps(
-        [{"elem_id": i + 1, "type": "DynAnswerType_UC", "data": f"{x},{y}"}
-         for i, (x, y) in enumerate(pts)], separators=(",", ":"))),
-    # ③ 一条记录，坐标用逗号连着铺开（单点时与 ① 等价）
-    ("uc_join_comma", lambda pts, ids: json.dumps(
-        [{"elem_id": 1, "type": "DynAnswerType_UC",
-          "data": ",".join(f"{x},{y}" for x, y in pts)}], separators=(",", ":"))),
-    # ④ 提交区域编号而不是坐标（用真实格子编号，不是瞎填 1）
+    # ① 【正确格式】一条记录，elem_id=1，data=区域编号逗号串
     ("uc_region_ids", lambda pts, ids: json.dumps(
         [{"elem_id": 1, "type": "DynAnswerType_UC",
           "data": ",".join(str(i) for i in ids)}], separators=(",", ":"))),
+    # 以下三种**仅为排查保留**（QQ_SLIDER_CLICK_PROBE=1 时才会试），
+    # 源码已证明它们不对，留着是为了万一腾讯改版时能快速对照。
+    # ② 坐标、分号分隔
+    ("uc_join_semicolon", lambda pts, ids: json.dumps(
+        [{"elem_id": 1, "type": "DynAnswerType_UC",
+          "data": ";".join(f"{x},{y}" for x, y in pts)}], separators=(",", ":"))),
+    # ③ 每个点击一条记录，elem_id 递增
+    ("uc_multi_record", lambda pts, ids: json.dumps(
+        [{"elem_id": i + 1, "type": "DynAnswerType_UC", "data": f"{x},{y}"}
+         for i, (x, y) in enumerate(pts)], separators=(",", ":"))),
+    # ④ 坐标、逗号连着铺开
+    ("uc_join_comma", lambda pts, ids: json.dumps(
+        [{"elem_id": 1, "type": "DynAnswerType_UC",
+          "data": ",".join(f"{x},{y}" for x, y in pts)}], separators=(",", ":"))),
 )
+
+# 点选 verify 的 errorCode 语义（扒自 dy-ele 的 verify 分发表）。
+#
+#   0   verifySuccess          成功
+#   9   verifyFailRefresh      验证失败，**换一张题重来**（不是「会话无效」！）
+#   12  verifyError            风控/环境异常
+#   20  verifySessionTimeout   会话超时
+#   50  verifyFail             答案不对
+#   51  verifyHybrid           混合验证（答案不对那类）
+#   52  verifyError
+#   206 verifySessionTimeout
+#
+# ⚠️ 9 的语义尤其重要：历史记录里把「假 cap_cd 会话下的 ec=9」理解成
+# 「会话本身无效、无法验证格式」，于是放弃了从提交实验反推格式。
+# 现在源码在手，格式已经确定，不必再依赖那个推断。
+EC_SUCCESS = "0"
+EC_WRONG_ANSWER = ("50", "51")
+EC_REFRESH = "9"          # 换题重来
+
 
 
 def _region_centers(regions: Sequence[Sequence[int]]) -> list[tuple[int, int]]:
@@ -203,6 +244,7 @@ def solve_click(
     recognizer,
     top_k: int = 3,
     probe_formats: bool | None = None,
+    refresh_attempts: int = 3,
 ) -> dict[str, Any]:
     """跑一次点选题。
 
@@ -213,9 +255,13 @@ def solve_click(
     @param recognizer    ClickRecognizer 实例
     @param top_k         CV 预筛保留几格给 CLIP
     @param probe_formats **是否逐个试 ans 格式**。
-        默认只试最可能的那一种（快，~4s）。打开后会把 4 种都试一遍
-        （慢一倍，每次都要换新会话），只在排查「提交格式到底哪个对」时用。
+        默认**只试源码确认的那一种**（快，~5s）。打开后把 4 种都试一遍
+        （慢一倍，每次都要换新会话），只在排查「腾讯改版了没有」时用。
         默认值取环境变量 `QQ_SLIDER_CLICK_PROBE`。
+    @param refresh_attempts
+        默认格式下遇到 `ec=9`（`verifyFailRefresh`）时的重试次数。
+        ec=9 的语义是「这道题没过，换一张重来」，所以值得换会话再试；
+        每换一次会话就是**另一道题**，必须重新识别。
     @returns 与滑块一致的 result dict（含 ok/ticket/errorCode/...）
     """
     if probe_formats is None:
@@ -233,11 +279,14 @@ def solve_click(
     if not isinstance(sess, str) or not sess:
         raise ClickSolveError("prehandle 没给 sess")
 
-    # 默认只试第一种格式（`uc_join_semicolon`，与滑块 ans 结构最接近）：
-    # 每换一种格式都要**重新 prehandle 换会话**，而换了会话就是**另一道题**
-    # （实测 +2.5s/次，还得重新识别），常规路径不该为不确定的猜测付这个代价。
-    # 要探明哪种格式对时设 QQ_SLIDER_CLICK_PROBE=1。
-    formats = ANS_FORMATS if probe_formats else ANS_FORMATS[:1]
+    # 默认只用 `ANS_FORMATS[0]`（腾讯源码确认的格式），但 ec=9 时换题重试；
+    # 探格式模式才逐个试 4 种（每换一种都要重新 prehandle 换会话，
+    # 而换了会话就是**另一道题**，得重新识别，代价很高）。
+    if probe_formats:
+        plan: list[tuple[str, Any]] = list(ANS_FORMATS)
+    else:
+        first = ANS_FORMATS[0]
+        plan = [first] * max(1, int(refresh_attempts))
 
     result: dict[str, Any] = {}
     used_format = ""
@@ -245,15 +294,14 @@ def solve_click(
     last_pick = 0
     last_cands = None
     last_margin = None
+    refresh_seen = 0
 
-    for idx, (name, build) in enumerate(formats):
+    for idx, (name, build) in enumerate(plan):
         # 每一轮都从**当前这一张图**重新取题、重新识别 ——
         # 绝不复用上一轮的识别结果：换了会话就是换了题，旧索引是废的。
-        if idx == 0:
-            pre = solver.prehandle()
-        else:
-            pre = solver.prehandle()
-            LOG.debug("换会话重试格式 %s（新题，需重新识别）", name)
+        if idx > 0:
+            LOG.debug("换会话重试（格式 %s，第 %d 次）—— 新题，需重新识别", name, idx + 1)
+        pre = solver.prehandle()
 
         if pre.get("state") != 1:
             LOG.warning("格式 %s：prehandle state=%r", name, pre.get("state"))
@@ -285,7 +333,7 @@ def solve_click(
             continue
 
         picked_index = int(rec["pick_index"])
-        if idx == 0:
+        if idx == 0 or rec.get("margin") is not None:
             LOG.info("点选识别：选第 %d 格（候选 %s，margin=%.1f，%.2fs）",
                      picked_index + 1, rec.get("candidates"),
                      rec.get("margin") or 0, rec.get("seconds", 0))
@@ -311,24 +359,48 @@ def solve_click(
 
         ec = str(result.get("errorCode", ""))
         used_format = name
-        # 0 = 成功；50/51 是「答案错/被拒」，说明**格式被接受了**，别再换
-        if ec == "0" and result.get("ticket"):
+        if ec == EC_SUCCESS and result.get("ticket"):
             LOG.info("点选成功（格式 %s）", name)
             break
-        if ec in ("50", "51"):
+        if ec in EC_WRONG_ANSWER:
+            # 格式被接受、只是答案不对 → 再换格式也没用（换的只是 ans 拼法）
             LOG.info("点选格式 %s 被接受，但答案不对（ec=%s）→ 停止换格式", name, ec)
             break
+        if ec == EC_REFRESH:
+            # verifyFailRefresh：这道题没过，换一张题再来（不是会话无效）
+            refresh_seen += 1
+            LOG.info("点选 ec=9（verifyFailRefresh），换一张题重试（第 %d 次）", refresh_seen)
+            continue
         LOG.debug("点选格式 %s 返回 ec=%s，试下一个", name, ec)
 
     seconds = round(time.perf_counter() - started, 2)
-    ok = str(result.get("errorCode")) == "0" and bool(result.get("ticket"))
+    ec = str(result.get("errorCode", ""))
+    ok = ec == EC_SUCCESS and bool(result.get("ticket"))
+
+    # 失败原因要能一眼看懂：只报 `errorCode=9` 谁也判断不出是「认错了」还是
+    # 「环境被风控」。所以把**识别结果 + 重试次数 + 格式**一起写进 error，
+    # 日志里另有完整行（题面、候选、margin）。
+    if ok:
+        err_text = ""
+    elif ec == EC_REFRESH:
+        err_text = f"点选未通过（选第 {last_pick} 格，换题重试 {refresh_seen} 次仍失败）"
+    elif ec in EC_WRONG_ANSWER:
+        err_text = f"点选答案不对（选第 {last_pick} 格，errorCode={ec}）"
+    elif ec == "12":
+        err_text = f"点选被风控拦截（errorCode={ec}）"
+    elif ec:
+        err_text = f"点选失败（选第 {last_pick} 格，errorCode={ec}）"
+    else:
+        err_text = str(result.get("errMessage") or result.get("errorMessage") or "点选失败")
+
     return {
         "ok": ok,
         "ticket": result.get("ticket") or "",
         "randstr": result.get("randstr") or "",
-        "errorCode": str(result.get("errorCode", "")),
-        "error": "" if ok else str(result.get("errMessage") or result.get("errorMessage")
-                                   or f"errorCode={result.get('errorCode')}"),
+        "errorCode": ec,
+        "error": err_text,
+        # 上层（server.solve_once）读的是 errMessage，两边保持一致
+        "errMessage": err_text,
         "seconds": seconds,
         "kind": "click",
         "instruction": instruction,
@@ -336,6 +408,7 @@ def solve_click(
         "candidates": last_cands,
         "margin": last_margin,
         "ans_format": used_format,
+        "refresh_retries": refresh_seen,
         "solver": "local-clip",
     }
 

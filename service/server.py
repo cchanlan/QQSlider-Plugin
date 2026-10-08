@@ -219,13 +219,17 @@ def _solve_click_variant(solver, kind: str) -> dict:
         return {"errorCode": "-1", "errMessage": f"点选模块不可用：{err}"}
 
     top_k = int(os.environ.get("QQ_SLIDER_CLICK_TOPK", "3"))
+    # ec=9（verifyFailRefresh）时换题重试几次。默认 3 次；
+    # 每次都要重新 prehandle + 重新识别，所以别开太大。
+    refresh_attempts = int(os.environ.get("QQ_SLIDER_CLICK_REFRESH", "3"))
     try:
         rec = click_recognizer.get_recognizer(top_k=top_k)
     except Exception as err:  # noqa: BLE001
         return {"errorCode": "-1", "errMessage": f"点选识别器初始化失败：{err}"}
 
     try:
-        return click_solver.solve_click(solver, recognizer=rec, top_k=top_k)
+        return click_solver.solve_click(solver, recognizer=rec, top_k=top_k,
+                                        refresh_attempts=refresh_attempts)
     except click_solver.ClickNotSupported as err:
         # 模型没装好 → 真正回落到纯 CV（准确率约 48%，但总比直接失败好）
         return _solve_click_cv_fallback(solver, rec, err)
@@ -287,7 +291,9 @@ def _solve_click_cv_fallback(solver, recognizer, cause) -> dict:
         pw = ccfg.get("pow_cfg") or {}
         pa, pt = solver._pow(str(pw.get("prefix", "")), str(pw.get("md5", "")))
 
-        build = click_solver.ANS_FORMATS[0][1]
+        # 用**按名字取**而不是 `ANS_FORMATS[0]` —— 以后调整候选顺序时
+        # 这里不会跟着悄悄换掉格式（源码确认的是 uc_region_ids）。
+        build = dict(click_solver.ANS_FORMATS)["uc_region_ids"]
         ans = build([pick_pt], [pick_id])
         result = click_solver._submit(solver, sess, collect, eks, ans, pa, pt)
         result = dict(result)
@@ -394,7 +400,8 @@ def solve_once(
         "ticket": result.get("ticket") or "",
         "randstr": result.get("randstr") or "",
         "errorCode": str(result.get("errorCode", "")),
-        "error": "" if ok else str(result.get("errMessage") or f"errorCode={result.get('errorCode')}"),
+        "error": "" if ok else str(result.get("errMessage") or result.get("errorMessage")
+                                   or f"errorCode={result.get('errorCode')}"),
         "seconds": seconds,
         "uin": uin,
         "aid": aid,
@@ -403,10 +410,12 @@ def solve_once(
         "solver": result.get("solver") or "local",
     }
 
-    # 点选特有的诊断字段：题面、选中的格子、候选、置信度、用的是哪种提交格式。
-    # **必须显式透传** —— 上面那个 payload 是重新拼的，不带上就在这里丢了，
-    # 排查时只看得到 errorCode，完全不知道识别结果对不对。
-    for key in ("instruction", "pick", "candidates", "margin", "ans_format", "cv_rank"):
+    # 点选特有的诊断字段：题面、选中的格子、候选、置信度、用的是哪种提交格式、
+    # 换题重试了几次。**必须显式透传** —— 上面那个 payload 是重新拼的，
+    # 不带上就在这里丢了，排查时只看得到 errorCode，
+    # 完全不知道识别结果对不对、是「认错了」还是「环境被风控」。
+    for key in ("instruction", "pick", "candidates", "margin", "ans_format",
+                "cv_rank", "refresh_retries"):
         if key in result:
             payload[key] = result[key]
 
