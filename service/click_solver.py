@@ -190,6 +190,26 @@ EC_REFRESH = "9"           # 换题重来（源码里 refresh() 不带 sess，�
 
 
 
+def _img_fingerprint(img_url: Any) -> str:
+    """取「这张图」的指纹 —— 只用 `image=` 那个哈希，**不含 sess**。
+
+    为什么不能直接拿整个 `img_url` 当指纹：URL 形如
+
+        /cap_union_new_getcapbysig?img_index=1&image=<哈希>&sess=<会话>
+
+    同一张图在换会话后 `sess` 就变了，整个字符串跟着变 ——
+    拿它比对永远不相等，「有没有换题」的判断等于失效。
+    （`test_click_retry.py` 用例 ⑥ 就是靠这个抓出来的。）
+
+    取不到 `image=` 时退化成「去掉 sess 参数后的其余部分」，仍比整串可靠。
+    """
+    s = str(img_url or "")
+    m = re.search(r"[?&]image=([^&]+)", s)
+    if m:
+        return m.group(1)
+    return re.sub(r"[?&]sess=[^&]*", "", s)
+
+
 def _region_centers(regions: Sequence[Sequence[int]]) -> list[tuple[int, int]]:
     """把 [x0,y0,x1,y1] 换成中心点坐标（点击位置）。"""
     out = []
@@ -371,9 +391,10 @@ def solve_click(
     top_k: int = 3,
     probe_formats: bool | None = None,
     refresh_attempts: int = 3,
-    hybrid_attempts: int = 5,
+    hybrid_attempts: int = 8,
     min_separation: float = 3.0,
-    max_unrecognized: int = 8,
+    max_unrecognized: int = 10,
+    deadline_s: float = 160.0,
 ) -> dict[str, Any]:
     """跑一次点选题。
 
@@ -422,9 +443,22 @@ def solve_click(
         ★ 为什么单独给一份预算，而不是并进 `refresh_attempts`：
         实测失败的那两轮都是「续做预算被换题吃光」—— 认不出的多选要换题，
         而换题后新会话的第一题**必返 51 又要占一次续做预算**，两头抢同一份额度。
-        多选里「包含文字：X」出现得很频繁（实测约占 1/3），
         所以这类「没认出来」必须有自己的额度，否则认不出的题会把
         「能认出的题」的机会挤掉。
+    @param deadline_s
+        **墙钟时间预算**（秒），默认 160。
+
+        ★ 为什么需要它：修好「一遇挫就放弃」之后，重试预算从 5 涨到 8，
+        实测出现了一轮跑满 **165.9s** 的情况（连续撞上认不出的题）。
+        而插件侧单次超时默认 180s —— 再差一点就会变成「过码超时」，
+        **明明还能试却被上层掐断**，比提前收工更糟。
+
+        所以这里自己收口：超过预算就带着**当前已有的结果**正常返回
+        （最后一轮的 errorCode 会透出去，用户看到的是「点选未通过」
+        而不是「过码超时」，日志里也能看出是时间不够而中止）。
+
+        ⚠️ 这个值**跟着插件侧超时走**：`server.py` 读 `QQ_SLIDER_TIMEOUT_MS`
+        算出「插件超时 − 20s」。**别在这里写死** —— 两边硬编码一定会漂移。
     @returns 与滑块一致的 result dict（含 ok/ticket/errorCode/...）
     """
     if probe_formats is None:
@@ -432,15 +466,24 @@ def solve_click(
     started = time.perf_counter()
 
     # ── ① 首轮 prehandle（不带 sess = 开一道全新题）──────────────────
-    pre = solver.prehandle()
-    if pre.get("state") != 1:
-        raise ClickSolveError(f"prehandle state={pre.get('state')!r}")
-    data = pre.get("data") or {}
-    dyn = data.get("dyn_show_info") or {}
-    ccfg = data.get("comm_captcha_cfg") or {}
-    sess = pre.get("sess")
-    if not isinstance(sess, str) or not sess:
-        raise ClickSolveError("prehandle 没给 sess")
+    #
+    # ★ 这里必须和循环内一样**带退避重试**。旧代码裸调 `solver.prehandle()`，
+    #   一上来吃 403 就整个抛出去 —— 用户看到的就是「这一次直接失败」，
+    #   连一次重试都没有（实测「一半一半」的另一种形态）。
+    #   请求失败时返回 None，交给下面的循环去重试，而不是在这里抛。
+    pre: dict | None = None
+    for attempt in range(4):
+        try:
+            pre = solver.prehandle()
+            break
+        except Exception as err:  # noqa: BLE001
+            transient = ("403" in str(err) or "429" in str(err)
+                         or "Timeout" in type(err).__name__)
+            LOG.warning("点选：首轮 prehandle 异常（第 %d 次）%s: %s",
+                        attempt + 1, type(err).__name__, str(err)[:120])
+            if not transient or attempt == 3:
+                break
+            time.sleep(3.0 * (attempt + 1))
 
     refresh_attempts = max(1, int(refresh_attempts))
     hybrid_attempts = max(1, int(hybrid_attempts))
@@ -456,8 +499,9 @@ def solve_click(
     refresh_seen = 0
     hybrid_seen = 0
     skipped_seen = 0
-    # 上一张「认不出」的题面：用来检测「留 sess 到底有没有换题」
-    unrecognized_instr = ""
+    # 上一张「认不出」的图 URL：用来检测「留 sess 到底有没有换题」
+    # （用 URL 而不是题面 —— 题面会重复，见下面判断处的注释）
+    unrecognized_img = ""
     rounds = 0
     format_idx = 0
     # ★ 续做会话：51/30 之后由服务端下发，带它重新 prehandle 就在同一流程里；
@@ -476,6 +520,13 @@ def solve_click(
     while rounds < max_rounds:
         rounds += 1
 
+        # ★ 墙钟预算：超了就带着已有结果收工，绝不让上层按超时掐断
+        #   （实测有一轮跑满 165.9s，插件侧 180s 超时线已经很近了）。
+        if deadline_s and (time.perf_counter() - started) > float(deadline_s):
+            LOG.warning("点选：已用 %.1fs 超过预算 %.0fs，带着当前结果收工（第 %d 轮）",
+                        time.perf_counter() - started, float(deadline_s), rounds - 1)
+            break
+
         # 本轮用哪种 ans 拼法：探格式模式逐个试，正常模式恒用源码确认的那种。
         if probe_formats:
             if format_idx >= len(ANS_FORMATS):
@@ -493,6 +544,11 @@ def solve_click(
             pending_pre = None
         else:
             use_sess = "" if probe_formats else sess_hint
+            # 说明：这里先用旧 sess 试一次，拿到题后再比对指纹（见下面）。
+            # 「先用 sess 试」是有意的 —— 实测同一 sess 再取通常**会**换题，
+            # 这样只要 1 次请求就换到新题；一旦发现没换（同指纹），
+            # 下一轮才退回「开全新会话」。代价是「恰好没换」时多花 1 次请求，
+            # 换来的收益是正常路径省下一次「第一题必返 51」。
             # ★ 403 / 网络抖动要**退避重试**，不能直接放弃整次过码 ——
             #   腾讯对同一 IP 的高频 prehandle 会返 403，而这是**暂时**的
             #   （隔几秒就好）。实测连跑测试时 403 会成片出现，
@@ -510,9 +566,25 @@ def solve_click(
                         break
                     # 403 是腾讯对**同 IP 高频请求**的临时拒绝，退避要够长才有意义
                     time.sleep(3.0 * (attempt + 1))
+
             if pre is None:
-                LOG.warning("点选：prehandle 连续失败，放弃本次")
-                break
+                # ★★ 这里**绝不能 break**（2026-10-09 用户实测「一半一半」的根因）。
+                #
+                # 旧写法是 `pre is None → break`，于是：
+                #   第 1 轮答对拿 51 → 第 2 轮带 sess 取续做题时吃 403/超时
+                #   → 直接放弃整次过码，而 `result` 里还留着第 1 轮的 51
+                #   → 用户看到「混合验证续做 1 次，errorCode=51」，
+                #     明明还有一大截预算，换题逻辑**一次都没机会跑**。
+                #
+                # 正解：续做取不到题就退回「开新会话」，新会话也取不到就
+                # 隔几秒再试 —— 由 `max_rounds` 兜底，而不是一遇挫就收工。
+                if sess_hint:
+                    LOG.info("点选：带 sess 取续做题失败 → 退回开新会话重试（第 %d 轮）", rounds)
+                    sess_hint = ""
+                else:
+                    LOG.info("点选：取题失败，稍后重试（第 %d 轮）", rounds)
+                time.sleep(2.5)
+                continue
 
         # ★ prehandle 也可能**直接给 ticket**（源码：`if (i.ticket) ...onSuccess(...)`）——
         #   带 sess 续做时这条路会走通，所以先看有没有。
@@ -527,9 +599,17 @@ def solve_click(
             break
 
         if pre.get("state") != 1:
-            # state=217 是限频，换会话也没用，停。
-            LOG.warning("点选：prehandle state=%r（第 %d 轮）", pre.get("state"), rounds)
-            break
+            # state=217 是**限频**。同样不能直接放弃 ——
+            #   换成全新会话再试（限频是按 IP + 频次算的，隔几秒会自己恢复）。
+            LOG.warning("点选：prehandle state=%r（第 %d 轮，sess=%s）",
+                        pre.get("state"), rounds, "续做" if sess_hint else "新会话")
+            if sess_hint:
+                sess_hint = ""
+                time.sleep(2.0)
+                continue
+            # 新会话也拿不到题：多半是限频，等久一点再试一次
+            time.sleep(4.0)
+            continue
 
         ch = _parse_challenge(pre)
         if not isinstance(ch["sess"], str) or not ch["sess"]:
@@ -547,13 +627,22 @@ def solve_click(
 
         # ★ 上一轮「认不出、只留 sess 没提交」时，检查到底换没换题。
         #   服务端对同一 sess 的行为没有稳定保证（实测样本不足，403 打断），
-        #   所以这里主动兜底：**题面一字不差**就认为没换题，
+        #   所以这里主动兜底：**图还是同一张**就认为没换题，
         #   清空 sess 重开全新会话（实测必然换题，代价是多一次 51）。
-        if unrecognized_instr and ch["instruction"] == unrecognized_instr:
-            LOG.info("点选：留 sess 后题面仍是 %r → 没换题，改为开全新会话",
-                     ch["instruction"])
+        #
+        # ⚠️ 两个都必须注意：
+        #   ① 判据用图**不能**用题面 —— 题面会重复（实测「湖边」一次跑里出现 4 次），
+        #      拿题面比对会把「换了题但恰好同题面」误判成没换，白花一次 51。
+        #   ② 比图也**不能比整个 URL** —— `img_url` 里带着 `&sess=...`，
+        #      同一张图换 sess 后字符串就不同了，比对永远不相等、兜底等于没有。
+        #      （这个 bug 是 `test_click_retry.py` 用例 ⑥ 抓出来的：
+        #      连着 20 次都拿同一张图，却一直用旧 sess 重试、把预算烧光。）
+        #      所以只取 `image=` 那个哈希来比。
+        if unrecognized_img and _img_fingerprint(ch["img_url"]) == unrecognized_img:
+            LOG.info("点选：留 sess 后图还是同一张（%s…）→ 没换题，改为开全新会话",
+                     unrecognized_img[:40])
             sess_hint = ""
-            unrecognized_instr = ""
+            unrecognized_img = ""
             continue
 
         # 这道题是单选还是多选 —— 由 lang_headers 的措辞决定。
@@ -589,7 +678,7 @@ def solve_click(
                     #     代价是多一次「第一题必返 51」的开销
                     # 下面的 `unrecognized_instr` 检查会自动在这两者间切换。
                     skipped_seen += 1
-                    unrecognized_instr = ch["instruction"]
+                    unrecognized_img = _img_fingerprint(ch["img_url"])
                     LOG.info("点选多选：断层太小（%.2f < %.1f），本张认不出，"
                              "同一流程内换一道（第 %d 次，题面=%r）",
                              float(rec.get("separation") or 0), min_separation,
@@ -636,8 +725,8 @@ def solve_click(
 
         ans_json = build(sub["pts"], sub["ids"])
         LOG.debug("点选提交格式=%s ans=%s", name, ans_json)
-        # 这张认出来了、真的提交了 → 清掉「认不出的题面」标记
-        unrecognized_instr = ""
+        # 这张认出来了、真的提交了 → 清掉「认不出的图」标记
+        unrecognized_img = ""
         try:
             result = _submit(solver, ch["sess"], sub["collect"], sub["eks"],
                              ans_json, sub["pow_answer"], sub["pow_ms"])

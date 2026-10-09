@@ -305,11 +305,28 @@ def _solve_click_variant(solver, kind: str) -> dict:
     # ec=51/30（verifyHybrid）时带 sess 续做几次。默认 5 次。
     # ★ 点选第一题**必返 51**，续做那一轮才是多选题、才可能拿到 ticket，
     #   所以这个预算不能小（小于 2 就等于永远过不去）。
-    hybrid_attempts = int(os.environ.get("QQ_SLIDER_CLICK_HYBRID", "5"))
-    # 「断崖太小、这张认不出」时在同一流程内重摇几次。默认 8。
+    hybrid_attempts = int(os.environ.get("QQ_SLIDER_CLICK_HYBRID", "8"))
+    # 「断崖太小、这张认不出」时在同一流程内重摇几次。默认 10。
     # ★ 单独一份额度：这类题（典型「包含文字：X」）实测约占多选的 1/3，
     #   并进 refresh 额度会挤掉能认出的题的机会。
-    max_unrecognized = int(os.environ.get("QQ_SLIDER_CLICK_REROLL", "8"))
+    max_unrecognized = int(os.environ.get("QQ_SLIDER_CLICK_REROLL", "10"))
+    # 点选的**墙钟预算**（秒）—— 超过就带着当前结果收工。
+    #
+    # ★ 默认值由插件侧传进来的实际超时换算（`QQ_SLIDER_TIMEOUT_MS`），
+    #   留 20 秒余量给网络收尾和响应组装。
+    #   为什么必须联动、不能各写一个常量：点选重试预算调大后，
+    #   实测有一轮跑满 **165.9s** 才成功，而插件侧默认 180s ——
+    #   两边硬编码必然漂移，一旦 Python 侧预算超过插件超时，
+    #   就会在「明明还能试」的时候被上层掐断，用户看到「过码超时」。
+    #   取不到插件超时（手动跑服务排障）时才用 160 兜底。
+    deadline_default = 160.0
+    try:
+        _ms = float(os.environ.get("QQ_SLIDER_TIMEOUT_MS", "") or 0)
+        if _ms > 0:
+            deadline_default = max(30.0, _ms / 1000.0 - 20.0)
+    except ValueError:
+        pass
+    deadline_s = float(os.environ.get("QQ_SLIDER_CLICK_DEADLINE", "") or deadline_default)
     try:
         rec = click_recognizer.get_recognizer(top_k=top_k)
     except Exception as err:  # noqa: BLE001
@@ -319,7 +336,8 @@ def _solve_click_variant(solver, kind: str) -> dict:
         return click_solver.solve_click(solver, recognizer=rec, top_k=top_k,
                                         refresh_attempts=refresh_attempts,
                                         hybrid_attempts=hybrid_attempts,
-                                        max_unrecognized=max_unrecognized)
+                                        max_unrecognized=max_unrecognized,
+                                        deadline_s=deadline_s)
     except click_solver.ClickNotSupported as err:
         # 模型没装好 → 真正回落到纯 CV（准确率约 48%，但总比直接失败好）
         return _solve_click_cv_fallback(solver, rec, err)

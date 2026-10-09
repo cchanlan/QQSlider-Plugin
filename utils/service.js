@@ -1077,7 +1077,7 @@ function guardAllowsRestart(baseUrl) {
  *
  * @returns {Promise<{ok:boolean, started?:boolean, restarted?:boolean, error?:string}>}
  */
-export async function ensureRunning({ baseUrl, port, logger, rounds } = {}) {
+export async function ensureRunning({ baseUrl, port, logger, rounds, timeoutMs } = {}) {
   const alive = await health(baseUrl)
 
   if (alive) {
@@ -1119,7 +1119,7 @@ export async function ensureRunning({ baseUrl, port, logger, rounds } = {}) {
         ? `过码服务跑的是旧代码（${running} → ${disk}），正在重启以加载新版本…`
         : "过码服务是旧版本（报不出代码指纹），正在重启以加载新版本…",
     )
-    const stopped = await restartService({ baseUrl, logger, port })
+    const stopped = await restartService({ baseUrl, logger, port, timeoutMs })
     if (!stopped) {
       return {
         ok: false,
@@ -1145,6 +1145,14 @@ export async function ensureRunning({ baseUrl, port, logger, rounds } = {}) {
       const env = { ...pipEnv() }
       const nodeBin = findNode()
       if (nodeBin) env.QQ_SLIDER_NODE = nodeBin
+      // ★ 把**插件侧的过码超时**透给 Python，让它据此算自己的墙钟预算。
+      //
+      // 为什么不能让两边各写一个常量：点选重试预算调大之后，
+      // 实测有一轮跑满 165.9s 才成功，而插件侧默认 180s —— 
+      // 两边硬编码必然会漂移，一旦 Python 侧预算超过插件超时，
+      // 就会在**明明还能试**的时候被上层掐断，用户看到「过码超时」。
+      // 所以这里传实际超时值，Python 侧按它留出余量（见 click_solver.deadline_s）。
+      if (timeoutMs > 0) env.QQ_SLIDER_TIMEOUT_MS = String(Math.round(timeoutMs))
 
       child = spawn(venvPython(), args, {
         cwd: SERVICE_DIR,
@@ -1197,7 +1205,7 @@ export async function ensureRunning({ baseUrl, port, logger, rounds } = {}) {
  *
  * @returns {Promise<boolean>} 是否确认已停
  */
-export async function restartService({ baseUrl, logger, port } = {}) {
+export async function restartService({ baseUrl, logger, port, timeoutMs } = {}) {
   const before = await health(baseUrl, 2500)
   if (!before) return true // 本来就没跑
 

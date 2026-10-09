@@ -31,7 +31,7 @@ export async function solveSlider({
   if (!base) throw new Error("过码服务地址为空")
 
   // 没在跑就先拉起来（首次会装依赖，可能久一点）
-  const ready = await ensureRunning({ baseUrl: base, port, logger })
+  const ready = await ensureRunning({ baseUrl: base, port, logger, timeoutMs: timeout })
   if (!ready.ok) throw new Error(ready.error || "过码服务启动失败")
 
   const controller = new AbortController()
