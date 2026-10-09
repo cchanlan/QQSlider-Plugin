@@ -484,30 +484,9 @@ def solve_once(
             raise
 
     seconds = round(time.perf_counter() - started, 2)
-    ok = str(result.get("errorCode")) == "0" and bool(result.get("ticket"))
-    payload = {
-        "ok": ok,
-        "ticket": result.get("ticket") or "",
-        "randstr": result.get("randstr") or "",
-        "errorCode": str(result.get("errorCode", "")),
-        "error": "" if ok else str(result.get("errMessage") or result.get("errorMessage")
-                                   or f"errorCode={result.get('errorCode')}"),
-        "seconds": seconds,
-        "uin": uin,
-        "aid": aid,
-        "cap_cd": cap_cd,
-        "kind": kind,
-        "solver": result.get("solver") or "local",
-    }
-
-    # 点选特有的诊断字段：题面、选中的格子、候选、置信度、用的是哪种提交格式、
-    # 换题重试了几次。**必须显式透传** —— 上面那个 payload 是重新拼的，
-    # 不带上就在这里丢了，排查时只看得到 errorCode，
-    # 完全不知道识别结果对不对、是「认错了」还是「环境被风控」。
-    for key in ("instruction", "pick", "candidates", "margin", "ans_format",
-                "cv_rank", "refresh_retries"):
-        if key in result:
-            payload[key] = result[key]
+    payload = _build_payload(result, uin=uin, aid=aid, cap_cd=cap_cd,
+                             kind=kind, seconds=seconds)
+    ok = bool(payload["ok"])
 
     # 题型不是滑块时，可选回落到第三方（默认关闭，见 FALLBACK_URL）
     if not ok and kind not in ("slide", "click") and FALLBACK_URL:
@@ -517,6 +496,57 @@ def solve_once(
             payload["kind"] = kind
             payload["solver"] = "fallback"
             LOG.info("↩️ 已回落第三方成功 %.2fs", fb.get("seconds", 0))
+    return payload
+
+
+# 点选特有的诊断字段：题面、选中的格子、候选、置信度、用的是哪种提交格式、
+# 重试了几次。**必须显式透传** —— payload 是重新拼的，
+# 不带上就在这里丢了，排查时只看得到 errorCode，
+# 完全不知道识别结果对不对、是「认错了」还是「环境被风控」。
+_PASSTHROUGH_KEYS = (
+    "instruction", "pick", "picks", "multi", "candidates", "margin",
+    "ans_format", "cv_rank", "refresh_retries", "hybrid_retries",
+    "unrecognized_retries", "rounds", "solver",
+)
+
+
+def _build_payload(result: dict, *, uin: str = "", aid: str = "",
+                   cap_cd: str = "", kind: str = "slide",
+                   seconds: float = 0.0) -> dict:
+    """把 solver 的返回拼成 HTTP 响应的 payload。
+
+    抽成独立函数是为了**可测** —— 这里曾经出过一次静默丢信息的事故：
+
+      `click_solver` 返回的失败结构是 `{"error": "选第 4 格…"}`，
+      而本函数只读 `result["errMessage"]` → 点选的详细原因被整个丢掉，
+      用户只看到 JS 兜底的一句 `errorCode=9`，把「轨迹与答案不一致」
+      误判成「会话无效」，白排查了很久。
+
+    这类 bug 不抛异常、不报错，只是信息消失，所以要有测试钉住
+    （见 `test_contract.py` 的 ① 与变异测试 M1）。
+    """
+    ok = str(result.get("errorCode")) == "0" and bool(result.get("ticket"))
+    payload = {
+        "ok": ok,
+        "ticket": result.get("ticket") or "",
+        "randstr": result.get("randstr") or "",
+        "errorCode": str(result.get("errorCode", "")),
+        # 四个键依次兜底：errMessage（各 solver 的现代写法）→ errorMessage
+        # → error（点选 solver 用的键）→ 最后才退化成裸 errorCode
+        "error": "" if ok else str(
+            result.get("errMessage") or result.get("errorMessage")
+            or result.get("error") or f"errorCode={result.get('errorCode')}"
+        ),
+        "seconds": seconds,
+        "uin": uin,
+        "aid": aid,
+        "cap_cd": cap_cd,
+        "kind": kind,
+    }
+    payload["solver"] = result.get("solver") or "local"
+    for key in _PASSTHROUGH_KEYS:
+        if key in result:
+            payload[key] = result[key]
     return payload
 
 

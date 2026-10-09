@@ -17,6 +17,26 @@ python -m venv .venv
 .venv\Scripts\python.exe server.py            # 默认 127.0.0.1:8767
 ```
 
+## 自测（改完代码先跑这个）
+
+```bash
+cd service
+.venv\Scripts\python.exe test_contract.py     # Windows
+.venv/bin/python test_contract.py             # Linux
+```
+
+纯逻辑自测，**不联网、不要模型、不碰腾讯**，一秒出结果。钉住的是
+「改这里会静默坏掉」的六类契约：
+
+| # | 钉住什么 | 踩过的坑 |
+|---|---|---|
+| ① | 失败原因必须透出来 | `click_solver` 返回 `error`、`server` 只读 `errMessage` → 用户只看到 `errorCode=9`，把「轨迹与答案不一致」误判成「会话无效」 |
+| ② | `51/30` 属于 `verifyHybrid` | 曾被归进「答案不对」直接放弃 → 每次都在第一题退出 |
+| ③ | 单选/多选判定 | 靠 `lang_headers` 的「最/所有」措辞，判错就必错 |
+| ④ | 断层切分用 Otsu | 用「相邻最大差值」会被离群低分格带偏（「扫雪车」切 k=5 错、Otsu k=4 对）|
+| ⑤ | 轨迹与答案要对得上 | 曾出现 `ans` 选 1 格、`collect` 却喂全部 6 格 → 服务端判自相矛盾 |
+| ⑥ | `ans` 格式排序 | `ANS_FORMATS[0]` 必须是 `uc_region_ids`，曾把坐标格式排在第一位 |
+
 ## 接口
 
 ### `POST /solve`
