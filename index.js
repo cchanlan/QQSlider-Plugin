@@ -1,5 +1,5 @@
 import { makePluginConfig } from "./utils/config.js"
-import { installSliderHook, getStatus, baseUrlOf, listBots } from "./utils/hook.js"
+import { installSliderHook, getStatus, baseUrlOf, masterIds } from "./utils/hook.js"
 import { installDeps, depsReady, health, ensureRunning, restartService, codeHashInfo } from "./utils/service.js"
 
 logger.info(logger.yellow("- 正在加载 QQ 滑块过码插件"))
@@ -21,8 +21,8 @@ const { config, configSave } = await makePluginConfig(
     autoInstall: true,
     // 指令权限：master / admin / all
     permission: "master",
-    // 用哪个 bot 发主人通知（空 = 跟着框架默认，多个 bot 在线时会各发一份）
-    notifyBot: "",
+    // 过码通知发给哪个主人号（空 = 用框架配置里的主人，多个 bot 在线时可能各发一份）
+    notifyMaster: "",
   },
 )
 
@@ -76,9 +76,9 @@ export class QQSlider extends plugin {
           permission: config.permission,
         },
         {
-          // 指定用哪个 bot 发主人通知（多个 bot 在线时用得上）
+          // 指定过码通知发给哪个号（多个 bot 在线时用得上）
           reg: "^#滑块过码通知",
-          fnc: "NotifyBot",
+          fnc: "NotifyMaster",
           permission: config.permission,
         },
       ],
@@ -134,16 +134,19 @@ export class QQSlider extends plugin {
       `Python：${s.env?.python || "未找到"}`,
       `Node：${s.env?.node || "未找到"}`,
     ]
-    // 多 bot 在线时，通知由哪一个发（不指定就是框架默认，可能各发一份）
+    // 多 bot 在线时，过码通知发给谁
     {
-      const cur = String(config.notifyBot || "").trim()
-      const bots = listBots()
-      const hit = bots.find(b => b.id === cur)
-      lines.push(
-        cur
-          ? `通知：${cur}${hit?.name ? `（${hit.name}）` : ""}`
-          : `通知：跟框架默认${bots.length > 1 ? `（${bots.length} 个 bot 在线，会各发一份，可发 #滑块过码通知 指定）` : ""}`,
-      )
+      const cur = String(config.notifyMaster || "").trim()
+      if (cur) {
+        lines.push(`通知：只发给 ${cur}`)
+      } else {
+        const fromCfg = await masterIds(config)
+        lines.push(
+          fromCfg.length
+            ? `通知：框架主人 ${fromCfg.join("、")}`
+            : "通知：没读到主人号（发 #滑块过码通知 <QQ号> 指定）",
+        )
+      }
     }
     // 版本比对：跑的是不是磁盘上这份代码
     if (s.running) {
@@ -250,41 +253,28 @@ export class QQSlider extends plugin {
   }
 
   /**
-   * `#滑块过码通知`            —— 列出可用 bot 和当前设置
-   * `#滑块过码通知 <QQ号>`     —— 指定用这个 bot 发主人通知
-   * `#滑块过码通知 默认`       —— 清空设置，跟着框架默认走
+   * `#滑块过码通知`            —— 看当前通知发给谁
+   * `#滑块过码通知 <QQ号>`     —— **指定过码通知只发给这个号**
+   * `#滑块过码通知 默认`       —— 清空设置，用框架配置里的主人
    *
-   * 为什么需要：`Bot.sendMasterMsg` 是**广播**给所有在线 bot 的，
-   * 多个 bot 同时在线时主人会收到好几份一模一样的过码通知。
+   * 为什么需要：框架的 `sendMasterMsg` 是**广播** —— 多个 bot 同时在线时
+   * 主人会连着收到好几份一模一样的过码通知（实测 4 个 bot = 4 条）。
    */
-  async NotifyBot() {
+  async NotifyMaster() {
     const arg = String(this.e.msg || "")
       .replace(/^#滑块过码通知/, "")
       .trim()
 
-    const bots = listBots()
-    const cur = String(config.notifyBot || "").trim()
+    const cur = String(config.notifyMaster || "").trim()
 
-    const describe = () =>
-      bots.length
-        ? bots.map(b => `  ${b.id}${b.name ? `（${b.name}）` : ""}`).join("\n")
-        : "  （当前没有在线的 bot）"
-    const currentLine = () =>
-      `当前通知 bot：${cur ? `${cur}${nameOf(cur)}` : "未指定（多个 bot 在线时会各发一份）"}`
-    const nameOf = id => {
-      const hit = bots.find(b => b.id === String(id))
-      return hit?.name ? `（${hit.name}）` : ""
-    }
-
-    // 只看不改：列出可选项
     if (!arg) {
+      const fromCfg = await masterIds(config)
       await this.reply(
         [
-          currentLine(),
-          "可用 bot：",
-          describe(),
+          `过码通知发给：${cur ? cur : "跟框架配置（见下）"}`,
+          fromCfg.length ? `框架里的主人号：${fromCfg.join("、")}` : "框架里没读到主人号",
           "",
-          "发送 #滑块过码通知 <QQ号> 指定；发 #滑块过码通知 默认 恢复默认",
+          "发 #滑块过码通知 <QQ号> 指定只发给谁；发 #滑块过码通知 默认 恢复",
         ].join("\n"),
         true,
       )
@@ -292,34 +282,21 @@ export class QQSlider extends plugin {
     }
 
     if (arg === "默认" || arg === "清除" || arg === "取消") {
-      config.notifyBot = ""
+      config.notifyMaster = ""
       await configSave()
-      await this.reply(
-        ["已恢复默认（跟着框架走，多个 bot 在线时可能各发一份）", "可用 bot：", describe()].join("\n"),
-        true,
-      )
+      await this.reply("已恢复：通知按框架配置的主人号发", true)
       return
     }
 
     const id = arg.match(/\d{5,12}/)?.[0] || ""
     if (!id) {
-      await this.reply(`认不出 QQ 号：${arg}\n可用 bot：\n${describe()}`, true)
+      await this.reply(`认不出 QQ 号：${arg}`, true)
       return
     }
 
-    // 只在「有 bot 列表」时校验 —— 列表取不到说明框架挂法不同，
-    // 这时候拦住用户反而误事（也许他就是要指定一个暂时离线的号）
-    if (bots.length && !bots.some(b => b.id === id)) {
-      await this.reply(
-        [`没有这个 bot：${id}`, "可用 bot：", describe()].join("\n"),
-        true,
-      )
-      return
-    }
-
-    config.notifyBot = id
+    config.notifyMaster = id
     await configSave()
-    await this.reply(`通知 bot 已设为 ${id}${nameOf(id)}`, true)
+    await this.reply(`过码通知已改为只发给 ${id}`, true)
   }
 }
 

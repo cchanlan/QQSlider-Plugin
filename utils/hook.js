@@ -17,8 +17,16 @@
  * 所以这里**一律能力探测 + 多级兜底**，不假设某个方法一定存在。
  */
 
+import { fileURLToPath, pathToFileURL } from "node:url"
+import path from "node:path"
+
 import { health, depsReady, envReport } from "./service.js"
 import { solveSlider } from "./solver.js"
+// `findRoot()` 从插件目录往上找第一个带 `lib/plugins` 的目录 —— 就是框架根。
+// **别自己拼相对路径**：本文件在 `<root>/plugins/QQSlider-Plugin/utils/`，
+// 到 `<root>/lib/config/config.js` 要往上三级，少一级就永远 import 失败
+// （这正是 2026-10-09「指定推送没效果」的根因之一）。
+import { findRoot } from "./config.js"
 
 let installed = false
 /** 同一个 URL 只解一次（事件可能被重发） */
@@ -101,15 +109,240 @@ function uinList() {
   }
 }
 
-/** 主人（收通知的人）的号：先读框架配置，退化到「唯一在线账号」 */
-async function masterIds() {
-  try {
-    const cfg = (await import("../../lib/config/config.js")).default
-    const keys = Object.keys(cfg?.master || {}).filter(Boolean)
-    if (keys.length) return keys
-  } catch {
-    /* 取不到配置就往下退 */
+/**
+ * 无副作用地读框架的「主人配置」。
+ *
+ * ## 为什么不直接 `import(config.js)`
+ *
+ * 框架那个模块是个**带副作用的单例**：构造函数里就去
+ * `process.cwd()/config/default_config/` 读默认配置。而 cwd 不一定是框架根 ——
+ * 实测在 `E:\Yunzai` 下直接跑会：
+ *
+ *     Error: ENOENT: no such file or directory,
+ *            scandir 'E:\Yunzai\plugins\QQSlider-Plugin\config\default_config\'
+ *
+ * 于是整个 `masterIds()` 崩掉、回落到广播 —— **「指定主人」又白做了**。
+ * 所以这里自己读文件：`config/config/other.yaml`（或 `.json`）。
+ *
+ * 兼容三种落法（不同框架版本/用户手改都可能）：
+ *   · `config/config/other.yaml`   —— 标准
+ *   · `config/other.yaml`          —— 老一点的位置
+ *   · 各自的 `.json` 版本
+ *
+ * @returns {Promise<object>} 配置对象；读不到返回 {}
+ */
+async function readFrameworkOther(root) {
+  const fsMod = await import("node:fs")
+  const fs = fsMod?.default || fsMod
+  const { parse: parseYaml } = await loadYamlSafe()
+
+  const candidates = [
+    path.join(root, "config", "config", "other.yaml"),
+    path.join(root, "config", "config", "other.yml"),
+    path.join(root, "config", "other.yaml"),
+    path.join(root, "config", "other.yml"),
+    path.join(root, "config", "config", "other.json"),
+    path.join(root, "config", "other.json"),
+  ]
+
+  for (const f of candidates) {
+    try {
+      if (!fs.existsSync(f)) continue
+      const raw = fs.readFileSync(f, "utf8")
+      const data = f.endsWith(".json") ? JSON.parse(raw) : parseYaml(raw)
+      if (data && typeof data === "object") return data
+    } catch (err) {
+      logMsg("debug", `读 ${f} 失败：${err?.message || err}`)
+    }
   }
+  return {}
+}
+
+/** 拿宿主的 yaml 模块（`yaml` 优先，退 `js-yaml`）；都拿不到返回一个兜底 parse */
+async function loadYamlSafe() {
+  for (const spec of ["yaml", "js-yaml"]) {
+    try {
+      const mod = await import(spec)
+      const lib = mod?.default || mod
+      if (typeof lib?.parse === "function") return { parse: lib.parse }
+      if (typeof lib?.load === "function") return { parse: lib.load }
+    } catch {
+      /* 试下一个 */
+    }
+  }
+  return { parse: parseYamlLite }
+}
+
+/**
+ * 极简 YAML 解析兜底 —— 只支持**我们真正需要的形状**。
+ *
+ * ## 什么时候会用到它
+ *
+ * 宿主没装 `yaml` / `js-yaml` 时。**这在真实环境是会发生的**：
+ * 插件不在框架的 `node_modules` 解析路径上（装在别处、或用了软链），
+ * `import("yaml")` 就会失败。实测把插件目录复制到临时目录跑，
+ * 就必然走这条路。
+ *
+ * ## 为什么第一版是错的（教训）
+ *
+ * 第一版只认 `key: value` 一行式，于是标准的多行列表
+ *
+ *     master:
+ *       - '3942704893:2606138772'
+ *
+ * 里 `master:` 的值为空被**整行跳过**，后面的 `- ...` 又不匹配 key 正则，
+ * 结果读出**空配置** → 拿不到主人号 → 悄悄退回广播。
+ * 「指定主人」看起来就还是没效果 —— 一个兜底函数写弱了，
+ * 把上面的功能整个废掉，而且**没有任何报错**。
+ *
+ * 所以这里把「`key:` 后面跟一串 `- item`」这种最常见的形状补上。
+ */
+function parseYamlLite(text) {
+  const out = {}
+  let curKey = null   // 正在收集的列表对应的 key
+
+  const unquote = s => String(s).trim().replace(/^["']|["']$/g, "")
+
+  for (const rawLine of String(text || "").split(/\r?\n/)) {
+    // 丢掉注释和空行（空行不清 curKey —— YAML 列表项之间允许空行）
+    const line = rawLine.replace(/\s+#.*$/, "")
+    if (!line.trim()) continue
+
+    const indent = line.length - line.trimStart().length
+    const t = line.trim()
+
+    // 列表项：`- xxx`（缩进比 key 深）
+    if (t.startsWith("- ")) {
+      const item = unquote(t.slice(2))
+      if (curKey && item) {
+        if (!Array.isArray(out[curKey])) out[curKey] = []
+        out[curKey].push(item)
+      }
+      continue
+    }
+
+    // key: value / key:
+    const m = /^([A-Za-z0-9_]+)\s*:\s*(.*)$/.exec(t)
+    if (!m) continue
+    const [, k, vRaw] = m
+    const v = vRaw.trim()
+    if (!v) {
+      // 空值 → 可能是「后面跟列表」，先占位，等 `- ` 行来填
+      curKey = indent === 0 ? k : curKey
+      if (indent === 0 && !(k in out)) out[k] = []
+      continue
+    }
+    curKey = null
+    if (v === "[]") out[k] = []
+    else if (v.startsWith("[") && v.endsWith("]")) {
+      out[k] = v.slice(1, -1).split(",").map(unquote).filter(Boolean)
+    } else out[k] = unquote(v)
+  }
+  return out
+}
+
+/**
+ * 读框架配置里的主人号 —— **收通知的人**。
+ *
+ * ## ⚠️ 两个曾经踩死的坑（2026-10-09 实测「指定 bot 推送没效果」的根因）
+ *
+ * **坑① 相对路径少了一级。** 本文件在 `<root>/plugins/QQSlider-Plugin/utils/`，
+ * 而框架配置在 `<root>/lib/config/config.js` —— 要往上**三级**：
+ *
+ *     utils/ → QQSlider-Plugin/ → plugins/ → <root>/lib/config/config.js
+ *     "../../lib/..."    → <root>/plugins/lib/...   ❌ 不存在
+ *     "../../../lib/..." → <root>/lib/...           ✓
+ *
+ * 路径错了就永远 import 失败 → 掉进兜底 → 拿不到主人号。
+ *
+ * **坑② `cfg.master` 的 key 是「bot 号」不是「主人号」。** TRSS 的
+ * `config.js` 里那段原文：
+ *
+ *     get master() { ... for (i of master) { i = i.split(":")
+ *       const bot_id = i.shift();  const user_id = i.join(":")
+ *       masters[bot_id] = [user_id] } return masters }
+ *     get uin() { return Object.keys(this.master) }      // ← 这里也是 bot 号
+ *
+ * 所以在配置里写 `master: ["123:456"]`（123=bot、456=主人）时，
+ * `Object.keys(cfg.master)` 拿到的是 **"123"（bot 自己）**。
+ * 直接拿它当收件人 = **把通知发给 bot 自己**，主人永远收不到。
+ * **要取的是 value（`master[bot]` 里的数组），那才是主人号。**
+ *
+ * ## 取号的优先级
+ *
+ *   ① 插件配置里的 `notifyMaster`（用户显式指定，最高优先）
+ *   ② 框架配置 `cfg.master` 的 **value 展开**（主人号）
+ *   ③ `cfg.masterQQ`（有些版本单独提供，是个数组）
+ *   ④ 兜底：唯一在线账号（只有他一个 bot 时，通常就是自己给自己发）
+ *
+ * @param {object} [cfg] 插件配置（含 notifyMaster）
+ * @returns {Promise<string[]>}
+ */
+export async function masterIds(cfg) {
+  /** @type {string[]} */
+  const out = []
+
+  const push = v => {
+    const s = String(v ?? "").trim()
+    if (s && !out.includes(s)) out.push(s)
+  }
+
+  // ① 插件里**显式指定**了收件人 → 就只发给他，不再叠加框架里的其它主人。
+  //    （指定了还发给别人，等于指定没用 —— 这正是「没效果」的观感来源。）
+  const want = String(cfg?.notifyMaster || "").trim()
+  if (want) push(want)
+
+  // ②③ 框架配置 —— **只在没显式指定时**才用，避免「指定了还发给别人」
+  //
+  // ⚠️ **不要 `import` 框架的 `lib/config/config.js`**。它是个带副作用的
+  //    单例：构造函数里去 `cwd/config/default_config/` 读默认配置，
+  //    而且 `process.cwd()` 不一定是框架根 —— 从别处调会直接
+  //    `ENOENT: scandir .../config/default_config/` 抛出来（实测在
+  //    `E:\Yunzai` 下直接跑就会崩），于是又掉回广播兜底。
+  //    所以这里**自己读 YAML/JSON 文件**，无副作用、稳。
+  if (!want) {
+    const root = findRoot()
+    if (root) {
+      try {
+        const raw = await readFrameworkOther(root)
+        // ★ 取 value 展开 —— key 是 bot 号，value 才是主人号（见上面坑②）
+        //
+        // ⚠️ `master` 在配置文件里是**扁平列表** `["bot号:主人号", ...]`，
+        //    框架的 `get master()` 才把它拆成 `{bot: [主人]}`。
+        //    所以我们自己读文件时**两种形状都要认**：
+        //      · 对象 `{ "bot": ["master"] }` → 取 value
+        //      · 列表 `["bot:master"]`        → 取 `:` 后面那段
+        const m = raw?.master
+        if (Array.isArray(m)) {
+          for (const item of m) {
+            const s = String(item ?? "").trim()
+            if (!s) continue
+            // "bot:master" / "bot:master1,master2" 都取冒号后的部分
+            const idx = s.indexOf(":")
+            if (idx >= 0) {
+              s.slice(idx + 1).split(/[,，、\s]+/).forEach(push)
+            }
+            // 没有冒号就认不出谁是主人，跳过（不能瞎猜成 bot 号）
+          }
+        } else if (m && typeof m === "object") {
+          for (const v of Object.values(m)) {
+            if (Array.isArray(v)) v.forEach(push)
+            else push(v)
+          }
+        }
+        // 有的版本单独给一个 masterQQ 数组
+        const mq = raw?.masterQQ || raw?.masterQQs
+        if (Array.isArray(mq)) mq.forEach(push)
+        else if (mq) push(mq)
+      } catch (err) {
+        logMsg("debug", `读框架主人配置失败（改用兜底）：${err?.message || err}`)
+      }
+    }
+  }
+
+  if (out.length) return out
+
+  // ④ 兜底：只有一个在线账号时就发给它
   return uinList().slice(0, 1)
 }
 
@@ -170,59 +403,84 @@ async function sendFromBot(botId, targetId, msg) {
 }
 
 /**
- * 给主人发消息。按可用性依次尝试：
+ * 给主人发消息。
  *
- *   0. **配置了 `notifyBot`** → 只用那一个 bot 发（避免多个 bot 各发一份）
- *   1. `Bot.sendMasterMsg`  —— TRSS / JiuLi 都有，最省事
- *   2. 直接给 cfg.master 里的号发好友消息
- *   3. 都不可用就只写日志，绝不因为「通知发不出去」把过码流程带崩
+ * ## 为什么要能「指定主人」（2026-10-09 主人要求）
  *
- * 导出是为了**可行为测试**（`test_notify.mjs` 直接调它，而不是 grep 源码）——
- * 上次接口契约的坑就是「只做字符串检查，同文件别的行恰好也让字符串出现」。
+ * 框架自带的 `Bot.sendMasterMsg` 是**广播**：它遍历所有在线 bot，
+ * 每个 bot 都给自己的主人发一遍 —— 所以主人有 4 个号在跑时，
+ * 一条过码通知会**收到 4 份**（截图里风间菜菜 / HLbot / HL喵喵 各发一条）。
+ *
+ * 一开始做的是「指定用哪个 bot 发」，但**实测没效果**，根因有两个（见 `masterIds`）：
+ *   ① 读框架配置的相对路径少了一级 → 永远 import 失败
+ *   ② `cfg.master` 的 key 是 **bot 号**、value 才是主人号，取反了 → 发给 bot 自己
+ *
+ * 改成「指定主人」之后语义清楚了：**只发给这一个号**，
+ * 由谁发不重要（谁在线谁发，发不出去依次换）。
+ *
+ * ## 发送顺序
+ *
+ *   ① 显式指定的 `notifyMaster`（或框架配的主人号）→ 逐个试
+ *   ② 说不清给谁时，才退回 `Bot.sendMasterMsg`（广播，可能多份）
+ *   ③ 都不行就只写日志，**绝不因为通知发不出去把过码流程带崩**
+ *
+ * 导出是为了**可行为测试**（`test_notify.mjs` 直接调它，而不是 grep 源码）。
  *
  * @param {string} msg
- * @param {object} [cfg] 当前配置（含 notifyBot）
+ * @param {object} [cfg] 当前配置（含 notifyMaster）
  */
 export async function notify(msg, cfg) {
-  const want = String(cfg?.notifyBot || "").trim()
+  const targets = await masterIds(cfg)
 
-  // ① 指定了通知 bot：只走它，发不出去才回落（回落是**故意的** ——
-  //    宁可多发一份，也不能让主人错过验证链接）
-  if (want) {
-    const targets = await masterIds()
+  // ① 有明确收件人 → **每个不同的主人都通知到**（`masterIds` 已去重，
+  //    所以「一个人有 4 个 bot」这种情况只会发 1 条，不会 4 条）。
+  //
+  //    「由谁发」不重要（谁在线谁发），只要发得出去就行 —— 依次试每个在线 bot。
+  //    `notifyBot` 是**内部**的可选覆盖项（默认空）：一般不用填，
+  //    主人只需关心「发给谁」（`notifyMaster`）。
+  if (targets.length) {
+    const explicitBot = String(cfg?.notifyBot || "").trim()
+    const senders = explicitBot ? [explicitBot, ...botIds()] : botIds()
+    let delivered = 0
     for (const t of targets) {
-      if (await sendFromBot(want, t, msg)) return
+      let ok = false
+      for (const botId of senders) {
+        if (await sendFromBot(botId, t, msg)) {
+          ok = true
+          break
+        }
+      }
+      // bot 通道都不行 → 试框架的通用通道（限定收件人，不是广播）
+      if (!ok) {
+        try {
+          if (typeof Bot?.pickFriend === "function") {
+            const friend = Bot.pickFriend(Number(t))
+            if (typeof friend?.sendMsg === "function") {
+              await friend.sendMsg(msg)
+              ok = true
+            }
+          }
+        } catch (err) {
+          logMsg("debug", `给 ${t} 发消息失败：${err?.message || err}`)
+        }
+      }
+      if (ok) delivered++
     }
-    logMsg("warn", `指定的通知 bot ${want} 发不出去，改用默认通道`)
+    if (delivered === targets.length) return
+    logMsg("warn", `部分主人号没发出去（成功 ${delivered}/${targets.length}），`
+                   + "改用默认通道兜底")
   }
 
+  // ② 说不清收件人 —— 退回广播（宁可多发一份，也不能让主人错过验证链接）
   if (typeof Bot?.sendMasterMsg === "function") {
     try {
       await Bot.sendMasterMsg(msg)
       return
     } catch (err) {
-      logMsg("debug", `sendMasterMsg 失败，改用备用通道：${err?.message || err}`)
+      logMsg("debug", `sendMasterMsg 失败：${err?.message || err}`)
     }
   }
 
-  const targets = await masterIds()
-  for (const id of targets) {
-    try {
-      if (typeof Bot?.pickFriend === "function") {
-        const friend = Bot.pickFriend(Number(id))
-        if (typeof friend?.sendMsg === "function") {
-          await friend.sendMsg(msg)
-          return
-        }
-      }
-      if (typeof Bot?.sendFriendMsg === "function") {
-        await Bot.sendFriendMsg(Bot.uin, Number(id), msg)
-        return
-      }
-    } catch (err) {
-      logMsg("debug", `给 ${id} 发消息失败：${err?.message || err}`)
-    }
-  }
   logMsg("info", `（通知未送达，仅记录）${msg}`)
 }
 
