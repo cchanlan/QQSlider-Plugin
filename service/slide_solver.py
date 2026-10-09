@@ -982,7 +982,33 @@ class SlideSolver:
             self._sanitize_cookies()
             return response
         except REQUEST_ERRORS as exc:
-            raise RetryableSolveError(f"GET {url} failed: {exc}") from exc
+            # ★ 把**响应体和状态码**一起带出来。
+            #
+            # 为什么必须这么做（2026-10-09 用户现场）：
+            # 日志里只有一句 `GET ... failed: 403 Client Error: Forbidden for url: ...`
+            # —— 而那个 URL 有 1000+ 字符（sess 超长），120 字符的截断把
+            # **真正的信息全吃掉了**：响应体是空的？还是带说明？带没带
+            # `X-Waf-*` 头？全看不到，只能靠猜。
+            #
+            # 腾讯网关的 403 通常会带一段 JSON 或 HTML 说明（限频 / 参数错 /
+            # 会话失效各不相同）。**留证比省几行日志重要得多。**
+            detail = ""
+            resp = getattr(exc, "response", None)
+            if resp is not None:
+                try:
+                    body = (resp.content or b"")[:400]
+                    text = body.decode("utf-8", "replace").strip()
+                    interesting = {k: v for k, v in (resp.headers or {}).items()
+                                   if any(t in k.lower() for t in
+                                          ("server", "waf", "tencent", "error", "reason",
+                                           "ret", "content-type", "content-length"))}
+                    detail = (f" [status={resp.status_code}"
+                              f" len={len(resp.content or b'')}"
+                              f" headers={interesting}"
+                              f" body={text!r}]")
+                except Exception:  # noqa: BLE001
+                    pass
+            raise RetryableSolveError(f"GET {url} failed: {exc}{detail}") from exc
 
 
     def _warm_session(self, *, force: bool = False) -> None:

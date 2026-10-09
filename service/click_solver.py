@@ -502,6 +502,10 @@ def solve_click(
     # 上一张「认不出」的图 URL：用来检测「留 sess 到底有没有换题」
     # （用 URL 而不是题面 —— 题面会重复，见下面判断处的注释）
     unrecognized_img = ""
+    # 「带 sess 取续做题」连续失败几次。≥2 就认定本 IP/会话的续做能力不可用，
+    # 之后不再尝试续做（避免「51→取题→403→换题→51」这种烧光预算的死循环）。
+    sess_fail_streak = 0
+    skip_hybrid = False
     rounds = 0
     format_idx = 0
     # ★ 续做会话：51/30 之后由服务端下发，带它重新 prehandle 就在同一流程里；
@@ -559,9 +563,20 @@ def solve_click(
                     pre = solver.prehandle(sess=use_sess)
                     break
                 except Exception as err:  # noqa: BLE001
-                    transient = "403" in str(err) or "429" in str(err) or "Timeout" in type(err).__name__
-                    LOG.warning("点选：prehandle 异常（第 %d 次）%s: %s",
-                                attempt + 1, type(err).__name__, str(err)[:120])
+                    transient = ("403" in str(err) or "429" in str(err)
+                                 or "Timeout" in type(err).__name__)
+                    # ★ 日志只留**关键部分**：`str(err)` 里带着 1000+ 字符的 URL
+                    #   （sess 超长），截 120 字符等于把真正的信息
+                    #   （状态码之后的响应体）全切掉。这里改成优先打
+                    #   `status=... headers=... body=...` 那段。
+                    msg = str(err)
+                    short = msg
+                    if " [status=" in msg:
+                        # `_get` 拼的详情在末尾，前面是没用的长 URL
+                        short = "…" + msg[msg.index(" [status="):]
+                    LOG.warning("点选：prehandle 异常（第 %d 次，sess=%s）%s: %s",
+                                attempt + 1, "有" if use_sess else "无",
+                                type(err).__name__, short[:400])
                     if not transient or attempt == 3:
                         break
                     # 403 是腾讯对**同 IP 高频请求**的临时拒绝，退避要够长才有意义
@@ -578,9 +593,24 @@ def solve_click(
                 #
                 # 正解：续做取不到题就退回「开新会话」，新会话也取不到就
                 # 隔几秒再试 —— 由 `max_rounds` 兜底，而不是一遇挫就收工。
+                #
+                # ⚠️ 但**不能变成死循环**：2026-10-09 用户现场的日志就是这样 ——
+                #   单选→51→带 sess 取题 403→退回新会话→又是单选→51→又 403…
+                #   连续 8 轮、烧掉 160 秒预算才被墙钟拦住。
+                #   那种情况下「带 sess 必定失败」是**稳定**的（同一 IP 被限频），
+                #   重试再多次也没用。所以这里记一笔：连续 N 次「带 sess 必失败」
+                #   就**不再尝试续做**，直接一路开新会话把题答完。
                 if sess_hint:
                     LOG.info("点选：带 sess 取续做题失败 → 退回开新会话重试（第 %d 轮）", rounds)
                     sess_hint = ""
+                    sess_fail_streak += 1
+                    if sess_fail_streak >= 2:
+                        # 两次都印证「带 sess 取不到题」→ 这一轮的续做能力实质不可用，
+                        # 后面别再浪费「51 → 取题 → 403」的往返，直接当答错处理。
+                        LOG.warning("点选：连续 %d 次带 sess 取题失败（本 IP 可能被限频）"
+                                    "→ 之后不再尝试续做，改用新会话作答",
+                                    sess_fail_streak)
+                        skip_hybrid = True
                 else:
                     LOG.info("点选：取题失败，稍后重试（第 %d 轮）", rounds)
                 time.sleep(2.5)
@@ -648,6 +678,9 @@ def solve_click(
         # 这道题是单选还是多选 —— 由 lang_headers 的措辞决定。
         #   第一题恒为单选（`选择$最$`），51 之后的续做题恒为多选（`选择$%所有%$`）。
         multi = is_multi_select(pre)
+        # 带 sess 取题**成功**了 → 说明续做能力可用，清掉失败计数
+        if sess_hint:
+            sess_fail_streak = 0
 
         if rounds == 1:
             LOG.info("点选：题面=%r 格子=%d 题型=%s",
@@ -747,6 +780,15 @@ def solve_click(
             #   这才是 51 的正解 —— 不是「答案不对」，更不该放弃。
             new_sess = result.get("sess") or ""
             hybrid_seen += 1
+            if skip_hybrid:
+                # 前面已连续两次印证「带 sess 取不到题」→ 再带着它去取也是 403，
+                # 只会把「51 → 取题 → 403 → 换题 → 51」这个圈子再转一遍。
+                # 直接当「这道题没过」，开新会话换题。
+                refresh_seen += 1
+                LOG.info("点选 ec=%s（verifyHybrid），但续做已判定不可用 → 直接换题（第 %d 次）",
+                         ec, refresh_seen)
+                sess_hint = ""
+                continue
             if not new_sess:
                 LOG.info("点选 ec=%s（verifyHybrid）但没给新 sess → 只能换新会话", ec)
                 sess_hint = ""
@@ -829,6 +871,8 @@ def solve_click(
         "refresh_retries": refresh_seen,
         "hybrid_retries": hybrid_seen,
         "unrecognized_retries": skipped_seen,
+        # 续做能力是否被判为不可用（本 IP/会话被限频时会置真）
+        "hybrid_disabled": skip_hybrid,
         "rounds": rounds,
         "solver": "local-clip",
     }

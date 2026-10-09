@@ -118,11 +118,18 @@ class FakeSession:
 
 
 class FakeSolver:
-    """按脚本吐 prehandle 结果，并记录每一次调用。"""
+    """按脚本吐 prehandle 结果，并记录每一次调用。
 
-    def __init__(self, prehandle_script, verify_script):
+    `fail_when_sess=True` 时**所有带 sess 的请求都失败** —— 这是复现用户现场
+    （2026-10-09：IP 被前几次失败登录打成限频，带 sess 续做恒 403）所必需的：
+    真实情况下 4 次重试**全部** 403，才会走到「带 sess 取续做题失败」那个分支。
+    只塞一两个 `RuntimeError` 是不够的 —— 重试第 2 次就成功了，分支根本不跑。
+    """
+
+    def __init__(self, prehandle_script, verify_script, fail_when_sess=False):
         self.prehandle_script = list(prehandle_script)
         self.verify_script = list(verify_script)
+        self.fail_when_sess = fail_when_sess
         self.prehandle_calls: list[str] = []
         self.verify_calls: list[dict] = []
         self._tdc_token = None
@@ -136,6 +143,8 @@ class FakeSolver:
 
     def prehandle(self, sess=""):
         self.prehandle_calls.append(sess)
+        if self.fail_when_sess and sess:
+            raise RuntimeError("403 Client Error: Forbidden")
         if not self.prehandle_script:
             raise RuntimeError("mock: prehandle 脚本用完了")
         step = self.prehandle_script.pop(0)
@@ -393,6 +402,108 @@ check("返回了正常结果结构（不是异常）", isinstance(res, dict) and
 check("失败文案仍是人话", bool(res.get("error"))
       and not str(res["error"]).startswith("errorCode="),
       f"{res.get('error')!r}")
+
+# ══════════════════════════════════════════════════════════════════
+print()
+print("=" * 78)
+print("⑧ ★ 死循环：带 sess 取题「稳定」失败时要止损（用户 2026-10-09 现场）")
+print("=" * 78)
+# 现场日志（本机、uin=0、IP 被前几次失败登录打成限频）：
+#   单选→51→带 sess 取题 403→退回新会话→又是单选→51→又 403 …
+#   连续 8 轮、烧掉 160 秒预算才被墙钟拦住。
+# 「带 sess 必定 403」是**稳定**的，重试再多次也没用 → 必须止损。
+solver = FakeSolver(
+    prehandle_script=[
+        # 首轮：成功（不带 sess）
+        make_pre(instruction="冰淇淋", langs=LANGS_SINGLE, img_seed="A", sess="S0"),
+        # 之后**所有不带 sess 的**都成功（换题正常），带 sess 的一律 403
+        make_pre(instruction="湖边", langs=LANGS_SINGLE, img_seed="B", sess="S2"),
+        make_pre(instruction="海角", langs=LANGS_SINGLE, img_seed="C", sess="S4"),
+        make_pre(instruction="栏杆", langs=LANGS_SINGLE, img_seed="D", sess="S5"),
+        make_pre(instruction="气球", langs=LANGS_MULTI, img_seed="E", sess="S6"),
+        make_pre(instruction="火车", langs=LANGS_MULTI, img_seed="F", sess="S7"),
+    ],
+    verify_script=[
+        {"errorCode": "51", "ticket": "", "sess": "S1"},   # 第1题对 → 想续做（必失败）
+        {"errorCode": "51", "ticket": "", "sess": "S3"},   # 换新会话又答对 → 再想续做（又失败）
+        {"errorCode": "51", "ticket": "", "sess": "S5"},   # 第3次51 → 应**直接换题**（skip_hybrid）
+        {"errorCode": "0", "ticket": "t03tserverMOCK8", "randstr": "@zzz"},
+    ],
+    fail_when_sess=True,     # ★ 复现用户现场：带 sess 的请求全 403
+)
+t0 = _time.time()
+res = click_solver.solve_click(solver, recognizer=FakeRecognizer(separation=30.0),
+                               hybrid_attempts=8, refresh_attempts=3,
+                               max_unrecognized=10, deadline_s=160.0)
+cost = _time.time() - t0
+print(f"        prehandle 调用序列 = {solver.prehandle_calls}")
+print(f"        耗时 {cost:.2f}s  rounds={res['rounds']}  续做={res['hybrid_retries']}")
+check("最终仍然成功（止损后靠换题拿到 ticket）", res["ok"] is True,
+      f"errorCode={res['errorCode']!r}")
+check("★ 续做被判定不可用（不再死循环）", res.get("hybrid_disabled") is True,
+      f"hybrid_disabled={res.get('hybrid_disabled')}")
+# ★★ 止损的**核心语义**：判定不可用之后，**不再反复尝试带 sess 的取题**。
+#
+# 为什么不能只断言「耗时 < N 秒」：实测「有止损」41s、「没止损」82s ——
+# 两边都远小于 160s 上限，用绝对阈值根本分不开（变异测试 D1 就是这么漏掉的）。
+# 真正的判据是**带 sess 的请求次数**：没止损时会一直重试（16 次），
+# 有止损时只在前两轮试满退避（8 次）。所以这里卡「次数」而不是「时间」。
+sess_calls = sum(1 for c in solver.prehandle_calls if c)
+check("★ 带 sess 的取题次数被压住（不是反复撞 403）", sess_calls <= 10,
+      f"带 sess 调用 {sess_calls} 次（无止损时会到 16 次）")
+check("★ 也没把 160 秒预算烧光", cost < 90, f"实际 {cost:.1f}s")
+check("轮数正常（不是跑满 21 轮）", res["rounds"] <= 12, f"rounds={res['rounds']}")
+check("止损只在连续失败 2 次后触发（不是一失败就放弃）",
+      solver.prehandle_calls.count("S1") >= 4,
+      f"第一次续做重试了 {solver.prehandle_calls.count('S1')} 次（应≥4，即试满退避）")
+
+# ══════════════════════════════════════════════════════════════════
+print()
+print("=" * 78)
+print("⑨ 403 的响应体必须留证（否则现场查不出原因）")
+print("=" * 78)
+# ★ 行为测试：造一个真会抛 403 的 HTTP 层，看错误串里有没有响应体。
+#   只 grep 源码字符串是不够的（变异 D3 证明：把拼装语句改成 `"" or (...)` 
+#   字符串仍在、但**运行时 detail 是空的**）。
+from slide_solver import SlideSolver as _SS, RetryableSolveError as _RSE  # noqa: E402
+
+class _FakeResp403:
+    status_code = 403
+    content = b'{"message":"rate limited","code":-508}'
+    headers = {"Server": "Trpc httpd", "Content-Type": "application/json"}
+
+class _FakeHTTP:
+    """最小 requests 替身：get 抛一个带 response 的 HTTPError。"""
+    def get(self, url, **kw):
+        import requests as _rq
+        err = _rq.HTTPError("403 Client Error: Forbidden")
+        err.response = _FakeResp403()
+        raise err
+
+_solver = _SS.__new__(_SS)          # 不走 __init__（要网络/随机）
+_solver._closed = False
+_solver.session = _FakeHTTP()
+_solver._sanitize_cookies = lambda: None
+# `_request_timeout` 是只读 property，内部读 `self.config` —— 得给个替身
+_solver.config = type("C", (), {"connect_timeout": 5, "read_timeout": 15})()
+
+try:
+    _solver._get("https://example.invalid/x")
+    check("_get 在 403 时应该抛异常", False)
+except _RSE as e:
+    msg = str(e)
+    check("★ 错误串里带上了响应体内容", "rate limited" in msg,
+          f"{msg[-120:]!r}")
+    check("★ 带上了状态码", "status=403" in msg, f"{msg[-120:]!r}")
+    check("★ 带上了关键响应头", "Trpc httpd" in msg or "Server" in msg)
+except Exception as e:  # noqa: BLE001
+    check("_get 抛的是 RetryableSolveError", False, f"实得 {type(e).__name__}")
+
+click_src = (HERE / "click_solver.py").read_text(encoding="utf-8")
+check("prehandle 异常日志会剥掉超长 URL（留证不截断）",
+      '" [status="' in click_src and "short = " in click_src)
+check("有 sess 续做失败计数", "sess_fail_streak" in click_src)
+check("有跳过续做的开关", "skip_hybrid" in click_src)
 
 # ══════════════════════════════════════════════════════════════════
 print()
